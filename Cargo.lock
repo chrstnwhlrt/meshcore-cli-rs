@@ -663,8 +663,8 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
 name = "meshcore"
-version = "0.9.0"
-source = "git+https://github.com/chrstnwhlrt/meshcore-rs#6083ef35872554a2269be51166fd1c06de61020b"
+version = "0.9.1"
+source = "git+https://github.com/chrstnwhlrt/meshcore-rs#38cd7f1970a5a0e2cea7f56a682bc387402d51b3"
 dependencies = [
  "bytes",
  "futures",
