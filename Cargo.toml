@@ -1,0 +1,75 @@
+[package]
+name = "meshcore-cli-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Christian Wohlert <christian667@gmail.com>"]
+description = "Command line interface to MeshCore companion radios"
+license = "MIT"
+repository = "https://github.com/chrstnwhlrt/meshcore-cli-rs"
+keywords = ["meshcore", "mesh", "networking", "cli", "lora"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "meshcore-cli-rs"
+path = "src/main.rs"
+
+[dependencies]
+# Our library
+meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs" }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive", "env", "string"] }
+
+# Interactive readline
+rustyline = { version = "17", features = ["derive"] }
+
+# Password input
+rpassword = "7.4"
+
+# Terminal manipulation and colors
+crossterm = "0.29"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+
+# Config directory
+directories = "6"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time formatting
+chrono = "0.4"
+
+# Hex encoding
+hex = "0.4"
+
+# SHA256 for channel keys
+sha2 = "0.10"
+
+# Base64 encoding
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
