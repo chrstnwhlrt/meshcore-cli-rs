@@ -214,15 +214,23 @@ async fn fetch_contacts_animated(app: &App) {
     }
     output::print("Fetching contacts ");
     let mut subscription = app.mc.subscribe();
-    if app.mc.get_contacts_async(0).await.is_err() {
-        output::print(" Error\n");
-        return;
-    }
-    let mut received = 0usize;
     // the reference waits in windows of 5 s and gives up after one without
     // a contact; other events do not count
     let window = std::time::Duration::from_secs(5);
     let mut window_end = tokio::time::Instant::now() + window;
+    match app.mc.get_contacts_async(0).await {
+        Ok(()) => {}
+        Err(meshcore::Error::Device(_) | meshcore::Error::Protocol(_)) => {
+            output::print(" Error\n");
+            return;
+        }
+        Err(e) => {
+            // like the reference, without ending the line
+            log::debug!("Timeout while getting contacts: {e}");
+            return;
+        }
+    }
+    let mut received = 0usize;
     let mut activity = false;
     loop {
         match tokio::time::timeout_at(window_end, subscription.recv()).await {
@@ -252,7 +260,6 @@ async fn fetch_contacts_animated(app: &App) {
                 window_end += window;
             }
             Ok(None) | Err(_) => {
-                // like the reference, without ending the line
                 log::debug!("Timeout while getting contacts");
                 return;
             }
