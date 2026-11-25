@@ -167,7 +167,7 @@ Everything lives in `~/.config/meshcore/` on all platforms. Files are only writt
 
 ## Differences to the Python reference
 
-BLE works on Linux only, through BlueZ. `-P` asks for the PIN in the terminal; in the reference it starts the pairing and the system's Bluetooth agent asks for the PIN. The connection is closed however the program ends, also by SIGTERM or SIGHUP, since BlueZ would keep it up and the device does not advertise meanwhile.
+BLE works on Linux only, through BlueZ. `-P` asks for the PIN in the terminal; in the reference it starts the pairing and the system's Bluetooth agent asks for the PIN. The connection is closed however the program ends, also by SIGTERM or SIGHUP. The reference leaves it up after SIGTERM, and the device does not advertise meanwhile.
 
 Fixed in this port, where the reference fails or prints wrong data:
 
