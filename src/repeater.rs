@@ -549,12 +549,14 @@ pub fn completion_tree() -> CompletionTree {
 }
 
 /// Runs repeater mode: one command from the command line, or the loop.
-pub fn run(port: &str, baudrate: i64, color: bool, args: &[String]) {
+/// Returns false when the port could not be opened.
+#[must_use]
+pub fn run(port: &str, baudrate: i64, color: bool, args: &[String]) -> bool {
     let mut repeater = match Repeater::open(port, baudrate, color) {
         Ok(r) => r,
         Err(message) => {
             println!("{}", paint(color, &message));
-            return;
+            return false;
         }
     };
     log::debug!("Serial port opened: {port}");
@@ -570,6 +572,7 @@ pub fn run(port: &str, baudrate: i64, color: bool, args: &[String]) {
             &format!("{}Disconnected from repeater.{}", ansi::BGRAY, ansi::END)
         )
     );
+    true
 }
 
 /// Removes the colors of a text when colors are off (`-c off`).

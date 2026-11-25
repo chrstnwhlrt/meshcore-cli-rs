@@ -238,10 +238,16 @@ async fn run(argv: Vec<String>, connection: &OnceLock<MeshCore>) -> ExitCode {
             return ExitCode::FAILURE;
         };
         let (baudrate, color, commands) = (o.target.baudrate, o.settings.color, o.commands.clone());
-        let _ =
+        // a port that cannot be opened is a failed connection (exit code 1)
+        let opened =
             tokio::task::spawn_blocking(move || repeater::run(&port, baudrate, color, &commands))
-                .await;
-        return ExitCode::SUCCESS;
+                .await
+                .unwrap_or(false);
+        return if opened {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
 
     let Some(mc) = connect::connect(&o.target).await else {
