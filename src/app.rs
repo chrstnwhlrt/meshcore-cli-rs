@@ -352,16 +352,12 @@ impl App {
 
     /// Locks the settings.
     pub fn settings(&self) -> MutexGuard<'_, Settings> {
-        self.settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::util::lock(&self.settings)
     }
 
     /// Locks the session state.
     pub fn state(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::util::lock(&self.state)
     }
 
     /// True when the device has a `cli` command.

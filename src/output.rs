@@ -13,10 +13,12 @@ use std::fs::File;
 use std::io::{IsTerminal as _, Write as _};
 use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Mutex, mpsc};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use rustyline::ExternalPrinter;
+
+use crate::util::lock;
 
 /// rustyline's printer for output above an active prompt.
 pub type BoxedPrinter = Box<dyn ExternalPrinter + Send>;
@@ -29,11 +31,6 @@ static AT_PROMPT: AtomicBool = AtomicBool::new(false);
 
 /// The first error writing to stdout.
 static STDOUT_ERROR: Mutex<Option<std::io::Error>> = Mutex::new(None);
-
-/// Locks a mutex, also after a panic of another thread.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Starts the thread that prints above the prompt. rustyline's printer
 /// waits while the line editor takes no text, as from Enter until the next

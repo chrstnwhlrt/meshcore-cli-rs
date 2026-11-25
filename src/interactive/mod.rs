@@ -386,7 +386,8 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
         }
 
         let mut sink = Sink::Stdout;
-        match Box::pin(process_redirected_line(
+        editor.lend();
+        let result = Box::pin(process_redirected_line(
             app,
             &line,
             nav.clone(),
@@ -394,8 +395,13 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
             &mut sink,
             "\n",
         ))
-        .await
-        {
+        .await;
+        let Some(idle) = LineEditor::take_back() else {
+            log::error!("line editor lost");
+            break;
+        };
+        editor = idle;
+        match result {
             Ok((contact, scope, ack)) => {
                 last_ack = ack;
                 nav.set_contact(contact);

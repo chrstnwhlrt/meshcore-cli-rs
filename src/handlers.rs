@@ -88,9 +88,7 @@ pub struct Handlers {
 
 impl Handlers {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::util::lock(&self.inner)
     }
 
     /// Starts `cmd` as handler for `kind`; returns its description.

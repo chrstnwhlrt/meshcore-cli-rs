@@ -450,7 +450,13 @@ impl Repeater {
             if matches!(cmd.to_lowercase().as_str(), "quit" | "exit" | "q") {
                 break;
             }
-            self.process_line(&cmd, false, Some(&name))?;
+            editor.lend();
+            let result = self.process_line(&cmd, false, Some(&name));
+            let Some(idle) = LineEditor::take_back() else {
+                break;
+            };
+            editor = idle;
+            result?;
             // a prompt that cannot be shown ends the loop, as in the reference
             if output::stdout_error().is_some() {
                 break;
@@ -515,12 +521,8 @@ fn file_argument(input: &str, index: usize) -> Option<String> {
 #[must_use]
 pub fn prompt_for_file() -> Option<String> {
     let history = paths::existing_config_dir().map(|_| paths::file_prompt_history());
-    let mut editor = LineEditor::new(history).ok()?;
-    editor.set_completion(Completion::Path);
-    let prompt = StyledPrompt::new("Enter filename (Tab to complete CTRL+C to cancel): ", false);
-    let line = editor.readline(&prompt).ok()?;
-    editor.remember(&line);
-    Some(line)
+    let prompt = "Enter filename (Tab to complete CTRL+C to cancel): ";
+    crate::editor::read_file_name(prompt, history).ok()
 }
 
 /// Decodes bytes as UTF-8, dropping invalid sequences (`errors='ignore'`).

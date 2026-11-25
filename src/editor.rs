@@ -10,12 +10,15 @@
 //! * output from other tasks goes through an external printer so that it
 //!   appears above the prompt (`prompt_toolkit`'s `patch_stdout`),
 //! * a password prompt shows a star for each character typed, and Ctrl-C
-//!   at any prompt ends only that prompt, as it does there.
+//!   at any prompt ends only that prompt, as it does there,
+//! * a line pasted along with a command answers the command's prompt.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
+use rustyline::config::Configurer as _;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
@@ -25,6 +28,7 @@ use rustyline::{ColorMode, CompletionType, Config, Context, Editor, Helper, Prom
 
 use crate::history::FileHistory;
 use crate::output;
+use crate::util::lock;
 use crate::util::text::escape_ansi;
 
 /// A prompt with a plain and a colored variant of the same width.
@@ -199,19 +203,11 @@ pub enum Completion {
     Path,
 }
 
-/// rustyline helper providing completion.
-pub struct CliHelper {
+/// rustyline helper providing completion, and the stars of a password.
+struct CliHelper {
     completion: Completion,
     files: FilenameCompleter,
-}
-
-impl CliHelper {
-    fn new() -> Self {
-        Self {
-            completion: Completion::None,
-            files: FilenameCompleter::new(),
-        }
-    }
+    masked: bool,
 }
 
 impl Completer for CliHelper {
@@ -255,39 +251,33 @@ impl Highlighter for CliHelper {
     ) -> Cow<'b, str> {
         Cow::Borrowed(prompt)
     }
+
+    /// Shows a star for each character of a password, like `prompt_toolkit`
+    /// does (`is_password=True`); a wide character gets as many stars as it
+    /// takes columns, which rustyline needs to place the cursor.
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        use unicode_width::UnicodeWidthStr as _;
+        if self.masked {
+            Cow::Owned("*".repeat(line.width()))
+        } else {
+            Cow::Borrowed(line)
+        }
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
+        self.masked && !matches!(kind, CmdKind::MoveCursor)
+    }
 }
 
 impl Validator for CliHelper {}
 
 impl Helper for CliHelper {}
 
-/// Shows a star for each character typed, like `prompt_toolkit` does for a
-/// password prompt (`is_password=True`); a wide character gets as many
-/// stars as it takes columns, which rustyline needs to place the cursor.
-struct PasswordHelper;
-
-impl Highlighter for PasswordHelper {
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        use unicode_width::UnicodeWidthStr as _;
-        Cow::Owned("*".repeat(line.width()))
-    }
-
-    fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
-        !matches!(kind, CmdKind::MoveCursor)
-    }
-}
-
-impl Completer for PasswordHelper {
-    type Candidate = String;
-}
-
-impl Hinter for PasswordHelper {
-    type Hint = String;
-}
-
-impl Validator for PasswordHelper {}
-
-impl Helper for PasswordHelper {}
+/// The line editor while no prompt is shown. Every prompt uses the same one:
+/// what was pasted after the line that answered the last prompt is in it, as
+/// `prompt_toolkit` hands text typed ahead to the next prompt, whichever it
+/// is.
+static IDLE: Mutex<Option<LineEditor>> = Mutex::new(None);
 
 /// Asks for a password (or PIN) without showing it. Ctrl-C and Ctrl-D end
 /// the prompt like any other line editor prompt, instead of the program.
@@ -296,13 +286,7 @@ impl Helper for PasswordHelper {}
 ///
 /// Returns `Interrupted` on Ctrl-C and `Eof` on Ctrl-D.
 pub fn read_password(prompt: &str) -> Result<String, ReadlineError> {
-    let config = Config::builder()
-        .auto_add_history(false)
-        .color_mode(ColorMode::Forced)
-        .build();
-    let mut editor: Editor<PasswordHelper, DefaultHistory> = Editor::with_config(config)?;
-    editor.set_helper(Some(PasswordHelper));
-    editor.readline(prompt)
+    ask(prompt, Completion::None, &[], true)
 }
 
 /// Reads one line without history or completion, like a bare
@@ -312,7 +296,47 @@ pub fn read_password(prompt: &str) -> Result<String, ReadlineError> {
 ///
 /// Returns `Interrupted` on Ctrl-C and `Eof` on Ctrl-D.
 pub fn read_line(prompt: &str) -> Result<String, ReadlineError> {
-    LineEditor::new(None)?.readline(&StyledPrompt::new(prompt, false))
+    ask(prompt, Completion::None, &[], false)
+}
+
+/// Asks for a file name, with path completion and the names given before.
+///
+/// # Errors
+///
+/// Returns `Interrupted` on Ctrl-C and `Eof` on Ctrl-D.
+pub fn read_file_name(prompt: &str, history: Option<PathBuf>) -> Result<String, ReadlineError> {
+    let mut history = history.map(FileHistory::new);
+    let names = history.as_mut().map(FileHistory::load).unwrap_or_default();
+    let name = ask(prompt, Completion::Path, &names, false)?;
+    if let Some(history) = &mut history {
+        history.append(&name);
+    }
+    Ok(name)
+}
+
+/// Reads a line at a prompt of its own.
+fn ask(
+    prompt: &str,
+    completion: Completion,
+    history: &[String],
+    masked: bool,
+) -> Result<String, ReadlineError> {
+    let mut editor = LineEditor::idle_or_new()?;
+    let prompt = StyledPrompt::new(prompt, false);
+    let result = editor.ask(&prompt, completion, history, masked);
+    editor.lend();
+    result
+}
+
+/// The settings of all line editors.
+fn config() -> rustyline::Result<Config> {
+    Ok(Config::builder()
+        .completion_type(CompletionType::List)
+        .auto_add_history(false)
+        .history_ignore_dups(true)?
+        .max_history_size(100_000)?
+        .color_mode(ColorMode::Enabled)
+        .build())
 }
 
 /// A line editor with `prompt_toolkit` compatible history.
@@ -324,41 +348,94 @@ pub struct LineEditor {
 }
 
 impl LineEditor {
-    /// Creates an editor; history is loaded from `history_path` if given.
+    /// An editor for the lines of a console; their history is loaded from
+    /// `history_path` if given.
     ///
     /// # Errors
     ///
     /// Returns an error if the terminal cannot be initialised.
     pub fn new(history_path: Option<PathBuf>) -> rustyline::Result<Self> {
-        let config = Config::builder()
-            .completion_type(CompletionType::List)
-            .auto_add_history(false)
-            .history_ignore_dups(true)?
-            .max_history_size(100_000)?
-            .color_mode(ColorMode::Enabled)
-            .build();
-        let mut editor: Editor<CliHelper, DefaultHistory> = Editor::with_config(config)?;
-        editor.set_helper(Some(CliHelper::new()));
-
-        let history = history_path.map(|path| {
+        let mut editor = Self::idle_or_new()?;
+        editor.history = history_path.map(|path| {
             let mut file = FileHistory::new(path);
             for entry in file.load() {
-                let _ = editor.add_history_entry(entry);
+                let _ = editor.editor.add_history_entry(entry);
             }
             file
         });
+        Ok(editor)
+    }
 
+    /// The idle editor, or a new one without history.
+    fn idle_or_new() -> rustyline::Result<Self> {
+        if let Some(editor) = Self::take_back() {
+            return Ok(editor);
+        }
+        let mut editor: Editor<CliHelper, DefaultHistory> = Editor::with_config(config()?)?;
+        editor.set_helper(Some(CliHelper {
+            completion: Completion::None,
+            files: FilenameCompleter::new(),
+            masked: false,
+        }));
         Ok(Self {
             editor,
-            history,
+            history: None,
             prints_above: false,
         })
     }
 
-    /// Sets the completion used for the next lines.
-    pub fn set_completion(&mut self, completion: Completion) {
+    /// Sets the completion used for the next lines; returns the one before.
+    pub fn set_completion(&mut self, completion: Completion) -> Completion {
+        self.editor
+            .helper_mut()
+            .map(|helper| std::mem::replace(&mut helper.completion, completion))
+            .unwrap_or_default()
+    }
+
+    /// Lets the prompts of a command use the editor until
+    /// [`take_back`](Self::take_back).
+    pub fn lend(self) {
+        *lock(&IDLE) = Some(self);
+    }
+
+    /// Takes the editor back that was lent.
+    #[must_use]
+    pub fn take_back() -> Option<Self> {
+        lock(&IDLE).take()
+    }
+
+    /// Reads a line at a prompt of its own: with other completion and
+    /// history, or masked.
+    fn ask(
+        &mut self,
+        prompt: &StyledPrompt,
+        completion: Completion,
+        history: &[String],
+        masked: bool,
+    ) -> Result<String, ReadlineError> {
+        let no_history = DefaultHistory::with_config(&config()?);
+        let console_history = std::mem::replace(self.editor.history_mut(), no_history);
+        for entry in history {
+            let _ = self.editor.add_history_entry(entry.as_str());
+        }
+        let console_completion = self.set_completion(completion);
+        self.set_masked(masked);
+        let result = self.readline(prompt);
+        self.set_masked(false);
+        self.set_completion(console_completion);
+        *self.editor.history_mut() = console_history;
+        result
+    }
+
+    /// Shows stars for what is typed, also on a terminal without colors.
+    fn set_masked(&mut self, masked: bool) {
+        self.editor.set_color_mode(if masked {
+            ColorMode::Forced
+        } else {
+            ColorMode::Enabled
+        });
         if let Some(helper) = self.editor.helper_mut() {
-            helper.completion = completion;
+            helper.masked = masked;
         }
     }
 
