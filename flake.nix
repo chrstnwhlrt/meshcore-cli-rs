@@ -1,69 +1,68 @@
 {
-  description = "meshcore-cli-rs - Rust CLI for MeshCore companion radios";
+  description = "meshcore-cli-rs - command line interface to MeshCore companion radios and repeaters";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # builds the git dependency on meshcore-rs without manual output hashes
     crane.url = "github:ipetkov/crane";
-    flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, nixpkgs, crane, flake-utils, rust-overlay, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ (import rust-overlay) ];
-        };
+  outputs = { self, nixpkgs, crane }:
+    let
+      # nixpkgs 26.11 dropped x86_64-darwin
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-        inherit (pkgs) lib;
-
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
-        };
-
-        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-        src = craneLib.cleanCargoSource ./.;
-
-        darwinDeps = lib.optionals pkgs.stdenv.isDarwin [
-          pkgs.darwin.apple_sdk.frameworks.IOKit
-          pkgs.darwin.apple_sdk.frameworks.Security
-        ];
-
-        commonArgs = {
-          inherit src;
-          inherit (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }) pname version;
-          strictDeps = true;
-          buildInputs = [ pkgs.libudev-zero ] ++ darwinDeps;
-          nativeBuildInputs = [ pkgs.pkg-config ];
-        };
-
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-        pkg = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
-      in
-      {
-        checks = {
-          inherit pkg;
-          clippy = craneLib.cargoClippy (commonArgs // {
+      build = pkgs:
+        let
+          inherit (pkgs) lib;
+          craneLib = crane.mkLib pkgs;
+          commonArgs = {
+            src = craneLib.cleanCargoSource ./.;
+            strictDeps = true;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            # D-Bus for BLE through BlueZ
+            buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.dbus ];
+          };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        in
+        {
+          inherit craneLib commonArgs cargoArtifacts;
+          package = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
+            meta.mainProgram = "meshcore-cli-rs";
+          });
+        };
+    in
+    {
+      packages = forAllSystems (pkgs: { default = (build pkgs).package; });
+
+      apps = forAllSystems (pkgs: {
+        default = {
+          type = "app";
+          program = nixpkgs.lib.getExe (build pkgs).package;
+          meta.description = "Command line interface to MeshCore companion radios and repeaters";
+        };
+      });
+
+      checks = forAllSystems (pkgs:
+        let b = build pkgs; in
+        {
+          package = b.package;
+          clippy = b.craneLib.cargoClippy (b.commonArgs // {
+            inherit (b) cargoArtifacts;
             cargoClippyExtraArgs = "--all-targets -- -D warnings";
           });
-          fmt = craneLib.cargoFmt { inherit src; };
-          test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+          fmt = b.craneLib.cargoFmt { inherit (b.commonArgs) src; };
+          test = b.craneLib.cargoTest (b.commonArgs // { inherit (b) cargoArtifacts; });
+        });
+
+      devShells = forAllSystems (pkgs: {
+        default = (build pkgs).craneLib.devShell {
+          checks = self.checks.${pkgs.stdenv.hostPlatform.system};
+          packages = [ pkgs.rust-analyzer ];
+          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
-
-        packages.default = pkg;
-
-        apps.default = flake-utils.lib.mkApp { drv = pkg; name = "meshcore-cli-rs"; };
-
-        devShells.default = craneLib.devShell {
-          checks = self.checks.${system};
-          packages = [ pkgs.cargo-watch pkgs.pkg-config pkgs.libudev-zero ] ++ darwinDeps;
-          PKG_CONFIG_PATH = "${pkgs.libudev-zero}/lib/pkgconfig";
-        };
-      }
-    );
+      });
+    };
 }

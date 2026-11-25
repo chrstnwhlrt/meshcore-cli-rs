@@ -1,448 +1,435 @@
-//! Output display formatting.
-//!
-//! Handles JSON vs human-readable output formatting.
+//! Display of incoming events and the background event task.
 
-use std::io;
+use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use chrono::{DateTime, TimeZone, Utc};
-use crossterm::ExecutableCommand;
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
-use meshcore::event::StatsData;
-use meshcore::types::{BatteryStatus, Channel, Contact, ContactType, DeviceInfo, SelfInfo};
-use serde::Serialize;
+use meshcore::Event;
 use serde_json::{Value, json};
 
-/// Output mode for the CLI.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OutputMode {
-    /// Human-readable output.
-    #[default]
-    Human,
-    /// JSON output.
-    Json,
+use crate::app::{App, Target, to_value, vint, vstr};
+use crate::output;
+use crate::util::ansi;
+use crate::util::json::dumps;
+use crate::util::text::escape_ansi;
+use crate::util::time::format_print_timestamp;
+
+/// Type names used in displays (`CONTACT_TYPENAMES`).
+pub const CONTACT_TYPENAMES: [&str; 5] = ["NONE", "CLI", "REP", "ROOM", "SENS"];
+
+/// Name of a contact type, `t:<n>` for unknown ones.
+#[must_use]
+pub fn type_name(kind: i64) -> String {
+    usize::try_from(kind)
+        .ok()
+        .and_then(|k| CONTACT_TYPENAMES.get(k))
+        .map_or_else(|| format!("t:{kind}"), |s| (*s).to_string())
 }
 
-/// Display configuration.
-#[derive(Debug, Clone)]
-pub struct Display {
-    /// Output mode.
-    pub mode: OutputMode,
-    /// Color enabled.
-    pub color: bool,
-}
-
-impl Default for Display {
-    fn default() -> Self {
-        Self {
-            mode: OutputMode::Human,
-            color: true,
-        }
+/// Formats a float like Python's `str(float)`.
+#[must_use]
+pub fn py_float(value: f64) -> String {
+    if value.is_nan() {
+        "nan".to_string()
+    } else if value.is_infinite() {
+        if value > 0.0 { "inf" } else { "-inf" }.to_string()
+    } else {
+        crate::util::json::py_float_repr(value)
     }
 }
 
-impl Display {
-    /// Creates a new display with the given mode.
-    #[must_use]
-    pub fn new(json: bool, color: bool) -> Self {
-        Self {
-            mode: if json {
-                OutputMode::Json
+/// Formats a json number the way Python prints it.
+#[must_use]
+pub fn py_number(value: &Value) -> String {
+    match value {
+        Value::Number(n) if n.is_f64() => py_float(n.as_f64().unwrap_or(0.0)),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Current terminal width like `shutil.get_terminal_size()`: `COLUMNS`
+/// when it holds a positive number, else the width of the terminal on
+/// stdout, else 80.
+#[must_use]
+pub fn terminal_width() -> usize {
+    if let Some(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| crate::util::py::int(&c, 10).ok())
+        .and_then(|c| usize::try_from(c).ok())
+        .filter(|c| *c > 0)
+    {
+        return cols;
+    }
+    terminal_size::terminal_size_of(std::io::stdout())
+        .map(|(w, _)| usize::from(w.0))
+        .filter(|w| *w > 0)
+        .unwrap_or(80)
+}
+
+/// A count as the signed number Python computes with.
+fn signed(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Python's `text[0:end]`: a negative `end` drops characters at the back.
+fn slice_to(text: &str, end: i64) -> String {
+    let count = usize::try_from(end).unwrap_or_else(|_| {
+        let back = usize::try_from(end.unsigned_abs()).unwrap_or(usize::MAX);
+        text.chars().count().saturating_sub(back)
+    });
+    text.chars().take(count).collect()
+}
+
+/// Formats a received message (`process_event_message`).
+///
+/// Also remembers the sender as last node (for `to !` and `!` replies).
+pub fn format_message(app: &App, data: &Value, json_output: bool, end: &str) -> String {
+    if json_output {
+        return format!("{}{end}", dumps(data));
+    }
+    let settings = app.settings().clone();
+    let mut path_str = String::new();
+
+    if data.get("sender_timestamp").is_some()
+        && let Some(ts) =
+            format_print_timestamp(&settings.timestamp, vint(data, "sender_timestamp"))
+    {
+        path_str.push_str(&ts);
+        path_str.push(',');
+    }
+    if vint(data, "path_len") == 255 {
+        path_str.push('D');
+    } else {
+        path_str.push_str(&vint(data, "path_len").to_string());
+    }
+    if let Some(snr) = data.get("SNR")
+        && settings.print_snr
+    {
+        let _ = write!(path_str, ",{}dB", py_number(snr));
+    }
+
+    let finish = |disp: String| -> String {
+        let disp = if settings.color {
+            disp
+        } else {
+            escape_ansi(&disp)
+        };
+        format!("{disp}{end}")
+    };
+
+    match vstr(data, "type").as_str() {
+        "PRIV" => {
+            let prefix = vstr(data, "pubkey_prefix");
+            let contact = app.mc.get_contact_by_key_prefix(&prefix);
+            let mut disp = String::new();
+            let name = if let Some(c) = &contact {
+                app.state().last_node = Some(Target::Contact(Box::new(c.clone())));
+                disp.push_str(match crate::app::contact_type(c) {
+                    4 => ansi::YELLOW,
+                    3 => ansi::CYAN,
+                    2 => ansi::MAGENTA,
+                    _ => ansi::BLUE,
+                });
+                c.name.clone()
             } else {
-                OutputMode::Human
-            },
-            color,
-        }
-    }
-
-    /// Returns true if JSON output is enabled.
-    #[must_use]
-    pub const fn is_json(&self) -> bool {
-        matches!(self.mode, OutputMode::Json)
-    }
-
-    /// Prints a JSON value. Only prints if JSON mode is enabled.
-    pub fn print_json<T: Serialize>(&self, value: &T) {
-        if self.is_json() {
-            if let Ok(json) = serde_json::to_string_pretty(value) {
-                println!("{json}");
-            }
-        }
-    }
-
-    /// Prints a success message.
-    pub fn print_ok(&self, message: &str) {
-        if self.is_json() {
-            self.print_json(&json!({ "ok": message }));
-        } else {
-            self.print_colored(message, Color::Green);
-        }
-    }
-
-    /// Prints an error message.
-    pub fn print_error(&self, message: &str) {
-        if self.is_json() {
-            self.print_json(&json!({ "error": message }));
-        } else {
-            self.print_colored(&format!("Error: {message}"), Color::Red);
-        }
-    }
-
-    /// Prints a warning message.
-    pub fn print_warning(&self, message: &str) {
-        if self.is_json() {
-            self.print_json(&json!({ "warning": message }));
-        } else {
-            self.print_colored(&format!("Warning: {message}"), Color::Yellow);
-        }
-    }
-
-    /// Prints colored text.
-    fn print_colored(&self, text: &str, color: Color) {
-        if self.color {
-            let mut stdout = io::stdout();
-            let _ = stdout.execute(SetForegroundColor(color));
-            let _ = stdout.execute(Print(text));
-            let _ = stdout.execute(ResetColor);
-            println!();
-        } else {
-            println!("{text}");
-        }
-    }
-
-    /// Prints self info.
-    pub fn print_self_info(&self, info: &SelfInfo) {
-        if self.is_json() {
-            self.print_json(&json!({
-                "adv_type": info.advert_type,
-                "tx_power": info.tx_power,
-                "max_tx_power": info.max_tx_power,
-                "public_key": info.public_key.to_hex(),
-                "adv_lat": info.latitude,
-                "adv_lon": info.longitude,
-                "multi_acks": info.multi_acks,
-                "adv_loc_policy": info.advert_loc_policy,
-                "telemetry_mode_base": info.telemetry_mode.base,
-                "telemetry_mode_loc": info.telemetry_mode.loc,
-                "telemetry_mode_env": info.telemetry_mode.env,
-                "manual_add_contacts": info.manual_add_contacts,
-                "radio_freq": info.radio.frequency_mhz,
-                "radio_bw": info.radio.bandwidth_khz,
-                "radio_sf": info.radio.spreading_factor,
-                "radio_cr": info.radio.coding_rate,
-                "name": info.name,
-            }));
-        } else {
-            println!("Name: {}", info.name);
-            println!("Public Key: {}", info.public_key.to_hex());
-            println!("TX Power: {} / {} dBm", info.tx_power, info.max_tx_power);
-            if let (Some(lat), Some(lon)) = (info.latitude, info.longitude) {
-                println!("Location: {lat:.6}, {lon:.6}");
-            }
-            println!(
-                "Radio: {:.3} MHz, {:.1} kHz BW, SF{}, CR 4/{}",
-                info.radio.frequency_mhz,
-                info.radio.bandwidth_khz,
-                info.radio.spreading_factor,
-                info.radio.coding_rate
-            );
-            println!("Multi-ACKs: {}", info.multi_acks);
-            println!(
-                "Telemetry: base={}, loc={}, env={}",
-                info.telemetry_mode.base, info.telemetry_mode.loc, info.telemetry_mode.env
-            );
-            println!("Manual add contacts: {}", info.manual_add_contacts);
-        }
-    }
-
-    /// Prints device info.
-    pub fn print_device_info(&self, info: &DeviceInfo) {
-        if self.is_json() {
-            self.print_json(&json!({
-                "firmware_version": info.firmware_version,
-                "max_contacts": info.max_contacts,
-                "max_channels": info.max_channels,
-                "ble_pin": info.ble_pin,
-                "build": info.build,
-                "model": info.model,
-                "version": info.version,
-            }));
-        } else {
-            println!("Firmware Version: {}", info.firmware_version);
-            if let Some(version) = &info.version {
-                println!("Version: {version}");
-            }
-            if let Some(model) = &info.model {
-                println!("Model: {model}");
-            }
-            if let Some(build) = &info.build {
-                println!("Build: {build}");
-            }
-            if let Some(max_contacts) = info.max_contacts {
-                println!("Max Contacts: {max_contacts}");
-            }
-            if let Some(max_channels) = info.max_channels {
-                println!("Max Channels: {max_channels}");
-            }
-            if let Some(pin) = info.ble_pin {
-                println!("BLE PIN: {pin:06}");
-            }
-        }
-    }
-
-    /// Prints battery status.
-    pub fn print_battery(&self, battery: &BatteryStatus) {
-        if self.is_json() {
-            self.print_json(&json!({
-                "millivolts": battery.millivolts,
-                "voltage": f64::from(battery.millivolts) / 1000.0,
-                "used_kb": battery.used_kb,
-                "total_kb": battery.total_kb,
-            }));
-        } else {
-            let voltage = f64::from(battery.millivolts) / 1000.0;
-            println!("Battery: {voltage:.2}V ({} mV)", battery.millivolts);
-            if let (Some(used), Some(total)) = (battery.used_kb, battery.total_kb) {
-                let percent = if total > 0 {
-                    (f64::from(used) / f64::from(total)) * 100.0
-                } else {
-                    0.0
-                };
-                println!("Storage: {used} / {total} KB ({percent:.1}% used)");
-            }
-        }
-    }
-
-    /// Prints current time.
-    pub fn print_time(&self, timestamp: u32) {
-        if self.is_json() {
-            self.print_json(&json!({ "time": timestamp }));
-        } else {
-            let dt: DateTime<Utc> = Utc
-                .timestamp_opt(i64::from(timestamp), 0)
-                .single()
-                .unwrap_or_else(Utc::now);
-            println!(
-                "Current time: {} ({timestamp})",
-                dt.format("%Y-%m-%d %H:%M:%S")
-            );
-        }
-    }
-
-    /// Prints a contact.
-    pub fn print_contact(&self, contact: &Contact) {
-        if self.is_json() {
-            self.print_json(&contact_to_json(contact));
-        } else {
-            let type_str = match contact.device_type {
-                ContactType::Node => "Node",
-                ContactType::Repeater => "Repeater",
-                ContactType::Room => "Room",
-                ContactType::Unknown => "Unknown",
+                log::debug!("Unknown contact with pubkey prefix: {prefix}");
+                disp.push_str(ansi::RED);
+                prefix
             };
-
-            let path_str = match contact.out_path_len.cmp(&0) {
-                std::cmp::Ordering::Less => "flood".to_string(),
-                std::cmp::Ordering::Equal => "direct".to_string(),
-                std::cmp::Ordering::Greater => format!("{} hops", contact.out_path_len),
-            };
-
-            println!(
-                "{} ({}) - {} [{}]",
-                contact.name,
-                type_str,
-                contact.public_key.to_hex(),
-                path_str
-            );
-            if let (Some(lat), Some(lon)) = (contact.latitude, contact.longitude) {
-                println!("  Location: {lat:.6}, {lon:.6}");
-            }
-        }
-    }
-
-    /// Prints a contact list.
-    pub fn print_contacts(&self, contacts: &[Contact]) {
-        if self.is_json() {
-            let json_contacts: Vec<Value> = contacts.iter().map(contact_to_json).collect();
-            self.print_json(&json_contacts);
-        } else {
-            for contact in contacts {
-                self.print_contact(contact);
-            }
-            println!("\nTotal: {} contacts", contacts.len());
-        }
-    }
-
-    /// Prints a channel.
-    pub fn print_channel(&self, channel: &Channel) {
-        if self.is_json() {
-            self.print_json(&json!({
-                "index": channel.index,
-                "name": channel.name,
-                "secret": hex::encode(channel.secret),
-            }));
-        } else {
-            println!(
-                "Channel {}: {} (secret: {})",
-                channel.index,
-                channel.name,
-                hex::encode(channel.secret)
-            );
-        }
-    }
-
-    /// Prints statistics.
-    pub fn print_stats(&self, stats: &StatsData) {
-        match stats {
-            StatsData::Core(s) => {
-                if self.is_json() {
-                    self.print_json(&json!({
-                        "type": "core",
-                        "battery_mv": s.battery_mv,
-                        "uptime_secs": s.uptime_secs,
-                        "errors": s.errors,
-                        "queue_len": s.queue_len,
-                    }));
-                } else {
-                    let voltage = f64::from(s.battery_mv) / 1000.0;
-                    let uptime_hours = s.uptime_secs / 3600;
-                    let uptime_mins = (s.uptime_secs % 3600) / 60;
-                    println!("Core Statistics:");
-                    println!("  Battery: {voltage:.2}V");
-                    println!("  Uptime: {uptime_hours}h {uptime_mins}m");
-                    println!("  Errors: {}", s.errors);
-                    println!("  Queue: {}", s.queue_len);
+            disp.push_str(&name);
+            if data.get("signature").is_some() {
+                let signature = vstr(data, "signature");
+                match app.mc.get_contact_by_key_prefix(&signature) {
+                    Some(sender) => {
+                        let _ = write!(disp, "/{}{}", ansi::BLUE, sender.name);
+                    }
+                    None => {
+                        let _ = write!(disp, "/{}{signature}", ansi::RED);
+                    }
                 }
             }
-            StatsData::Radio(s) => {
-                if self.is_json() {
-                    self.print_json(&json!({
-                        "type": "radio",
-                        "noise_floor": s.noise_floor,
-                        "rssi": s.rssi,
-                        "snr": s.snr,
-                        "tx_airtime_secs": s.tx_airtime_secs,
-                        "rx_airtime_secs": s.rx_airtime_secs,
-                    }));
-                } else {
-                    println!("Radio Statistics:");
-                    println!("  Noise Floor: {} dBm", s.noise_floor);
-                    println!("  Last RSSI: {} dBm", s.rssi);
-                    println!("  Last SNR: {:.2} dB", s.snr);
-                    println!("  TX Airtime: {}s", s.tx_airtime_secs);
-                    println!("  RX Airtime: {}s", s.rx_airtime_secs);
-                }
+            let _ = write!(disp, " {}({path_str})", ansi::ORANGE);
+            disp.push_str(if vint(data, "txt_type") == 1 {
+                ansi::LIGHT_GRAY
+            } else {
+                ansi::END
+            });
+            let _ = write!(disp, ": {}", vstr(data, "text"));
+            finish(disp)
+        }
+        "CHAN" => {
+            let disp = channel_prefix(app, data, &path_str);
+            finish(format!("{disp}{}: {}", ansi::END, vstr(data, "text")))
+        }
+        "DATA" => {
+            if !settings.display_channel_data {
+                return String::new();
             }
-            StatsData::Packets(s) => {
-                if self.is_json() {
-                    self.print_json(&json!({
-                        "type": "packets",
-                        "received": s.received,
-                        "sent": s.sent,
-                        "flood_tx": s.flood_tx,
-                        "direct_tx": s.direct_tx,
-                        "flood_rx": s.flood_rx,
-                        "direct_rx": s.direct_rx,
-                    }));
-                } else {
-                    println!("Packet Statistics:");
-                    println!(
-                        "  Received: {} (flood: {}, direct: {})",
-                        s.received, s.flood_rx, s.direct_rx
-                    );
-                    println!(
-                        "  Sent: {} (flood: {}, direct: {})",
-                        s.sent, s.flood_tx, s.direct_tx
-                    );
-                }
-            }
+            let disp = channel_prefix(app, data, &path_str);
+            finish(format!("{disp}{} {}", ansi::END, dumps(data)))
         }
-    }
-
-    /// Prints a message.
-    pub fn print_message(
-        &self,
-        sender: &str,
-        text: &str,
-        is_command: bool,
-        snr: Option<f32>,
-        rssi: Option<i8>,
-    ) {
-        if self.is_json() {
-            self.print_json(&json!({
-                "sender": sender,
-                "text": text,
-                "is_command": is_command,
-                "snr": snr,
-                "rssi": rssi,
-            }));
-        } else {
-            let signal = match (snr, rssi) {
-                (Some(s), Some(r)) => format!(" [{s:.2}/{r}]"),
-                (Some(s), None) => format!(" [{s:.2}]"),
-                _ => String::new(),
-            };
-            let prefix = if is_command { "$" } else { "" };
-            println!("{sender}{signal}: {prefix}{text}");
-        }
-    }
-
-    /// Prints message sent confirmation.
-    pub fn print_msg_sent(&self, expected_ack: u32, timeout_ms: u32) {
-        if self.is_json() {
-            self.print_json(&json!({
-                "type": 0,
-                "expected_ack": format!("{expected_ack:08x}"),
-                "suggested_timeout": timeout_ms,
-            }));
-        } else {
-            // Human mode: just silently wait for ack usually
-        }
-    }
-
-    /// Prints ACK received.
-    pub fn print_ack(&self, code: u32) {
-        if self.is_json() {
-            self.print_json(&json!({
-                "code": format!("{code:08x}"),
-            }));
-        } else {
-            self.print_colored("Msg acked", Color::Green);
-        }
-    }
-
-    /// Prints no more messages.
-    pub fn print_no_more_messages(&self) {
-        if self.is_json() {
-            self.print_json(&json!({ "no_more_messages": true }));
-        } else {
-            println!("No more messages");
-        }
+        _ => format!("{}{end}", dumps(data)),
     }
 }
 
-/// Converts a contact to JSON value.
-fn contact_to_json(contact: &Contact) -> Value {
-    json!({
-        "name": contact.name,
-        "public_key": contact.public_key.to_hex(),
-        "type": match contact.device_type {
-            ContactType::Unknown => 0,
-            ContactType::Node => 1,
-            ContactType::Repeater => 2,
-            ContactType::Room => 3,
-        },
-        "type_name": match contact.device_type {
-            ContactType::Unknown => "unknown",
-            ContactType::Node => "node",
-            ContactType::Repeater => "repeater",
-            ContactType::Room => "room",
-        },
-        "flags": contact.flags.as_byte(),
-        "path_len": contact.out_path_len,
-        "path": hex::encode(&contact.out_path),
-        "latitude": contact.latitude,
-        "longitude": contact.longitude,
-        "last_advert": contact.last_advert,
-        "last_modified": contact.last_modified,
+/// Channel name and path part of a channel message; remembers the channel.
+fn channel_prefix(app: &App, data: &Value, path_str: &str) -> String {
+    let idx = u8::try_from(vint(data, "channel_idx")).unwrap_or(0);
+    let path_str = format!("{}({path_str}){}", ansi::YELLOW, ansi::END);
+    let name = match app.cached_channel_name(idx) {
+        Some(name) => name,
+        None if idx == 0 => "public".to_string(),
+        None => format!("ch{idx}"),
+    };
+    app.state().last_node = Some(Target::Channel {
+        name: name.clone(),
+        index: i64::from(idx),
+    });
+    format!("{}{name} {path_str}", ansi::GREEN)
+}
+
+/// Handles an incoming message event (`handle_message`).
+async fn handle_message(app: &App, payload: Value) {
+    let _ = app.mc.ensure_contacts(false).await;
+    let json_output = app.settings().json_msgs;
+    output::print(&format_message(app, &payload, json_output, "\n"));
+    if vstr(&payload, "type") == "DATA" {
+        app.handlers.enqueue("chan_data", &payload);
+    } else {
+        app.handlers.enqueue("msgs", &payload);
+    }
+    app.log_message(payload);
+}
+
+/// Handles a received packet log (`handle_log_rx`).
+fn handle_log_rx(app: &App, mut payload: Value) {
+    let settings = app.settings().clone();
+    let payload_type = vint(&payload, "payload_type");
+    let mut lines = String::new();
+
+    if payload_type == 0x05 && settings.channel_echoes {
+        let mut chan_name = vstr(&payload, "chan_name");
+        let mut message = None;
+        if payload.get("message").is_some() {
+            message = Some(vstr(&payload, "message"));
+        } else if settings.echo_unk_chans || !chan_name.is_empty() {
+            if chan_name.is_empty() {
+                chan_name = vstr(&payload, "chan_hash");
+            }
+            message = Some(if payload.get("crypted").is_some() {
+                vstr(&payload, "crypted")
+            } else {
+                "-- unhandled --".to_string()
+            });
+        }
+        if let Some(message) = message.filter(|_| !chan_name.is_empty()) {
+            // computed with signs like the reference: in a narrow terminal
+            // or with a long path the text loses characters at the back
+            let width = signed(terminal_width());
+            let path = vstr(&payload, "path");
+            let path_len = signed(path.chars().count());
+            let cars = width - 13 - path_len - signed(chan_name.chars().count()) - 1;
+            let dispmsg = slice_to(&message.replace('\n', ""), cars);
+            let pad = usize::try_from(cars - signed(dispmsg.chars().count())).unwrap_or(0);
+            let snr = payload.get("snr").and_then(Value::as_f64).unwrap_or(0.0);
+            let rssi = vint(&payload, "rssi");
+            // with a COLUMNS value beyond the memory the reference fails
+            // building the padding and drops the rest of the event
+            if lines.try_reserve(pad).is_err() {
+                log::error!("Error in event handler for EventType.RX_LOG_DATA: ");
+                return;
+            }
+            let _ = write!(
+                lines,
+                "{}{chan_name} {}{dispmsg}",
+                ansi::LIGHT_GRAY,
+                ansi::DGREEN
+            );
+            lines.extend(std::iter::repeat_n(' ', pad));
+            let _ = writeln!(
+                lines,
+                " {}{}G{}[{path}]{}{snr:6.2}{rssi:4}{}",
+                ansi::START,
+                width - 11 - path_len,
+                ansi::YELLOW,
+                ansi::LIGHT_GRAY,
+                ansi::END
+            );
+        }
+    } else if payload_type == 0x04 && settings.advert_echoes {
+        let key = vstr(&payload, "adv_key");
+        let name = if payload.get("adv_name").is_some() {
+            vstr(&payload, "adv_name")
+        } else {
+            app.mc
+                .get_contact_by_key_prefix(&key)
+                .map_or_else(|| key.chars().take(12).collect(), |c| c.name.clone())
+        };
+        let ts_str = format_print_timestamp(&settings.timestamp, vint(&payload, "adv_timestamp"))
+            .map(|t| format!(" at {t}"))
+            .unwrap_or_default();
+        let mut txt = format!(
+            "{}Advert for{} {name}{}/{}{ts_str}{}",
+            ansi::LIGHT_GRAY,
+            ansi::END,
+            ansi::GREEN,
+            type_name(vint(&payload, "adv_type")),
+            ansi::END
+        );
+        if let Some(lat) = payload.get("adv_lat").filter(|v| !v.is_null()) {
+            let _ = write!(
+                txt,
+                " {}coords: {},{}",
+                ansi::LIGHT_GRAY,
+                py_number(lat),
+                py_number(payload.get("adv_lon").unwrap_or(&Value::Null))
+            );
+        }
+        let snr = payload.get("snr").and_then(Value::as_f64).unwrap_or(0.0);
+        let _ = writeln!(
+            txt,
+            " {}path: [{}] {}snr: {snr:.2}dB{}",
+            ansi::YELLOW,
+            vstr(&payload, "path"),
+            ansi::LIGHT_GRAY,
+            ansi::END
+        );
+        lines.push_str(&txt);
+    }
+
+    if !lines.is_empty() {
+        output::print(&if settings.color {
+            lines
+        } else {
+            escape_ansi(&lines)
+        });
+    }
+
+    // pkt_payload is already hex in the library's payload
+    if let Value::Object(map) = &mut payload
+        && let Some(Value::Array(bytes)) = map.get("pkt_payload")
+    {
+        let raw: Vec<u8> = bytes
+            .iter()
+            .filter_map(Value::as_u64)
+            .filter_map(|b| u8::try_from(b).ok())
+            .collect();
+        map.insert(
+            "pkt_payload".into(),
+            Value::String(crate::util::text::hex_lower(&raw)),
+        );
+    }
+    if settings.json_log_rx {
+        output::println(&dumps(&payload));
+    }
+    app.handlers.enqueue("rxlog", &payload);
+}
+
+/// Prints a note about an advert (`handle_advert`).
+fn handle_advert(app: &App, key: &str) {
+    let settings = app.settings().clone();
+    if !settings.print_adverts {
+        return;
+    }
+    let msg = if settings.json_msgs {
+        dumps(&json!({"event": "advert", "public_key": key}))
+    } else {
+        let name = app
+            .mc
+            .get_contact_by_key_prefix(key)
+            .map_or_else(|| "<Unknown Contact>".to_string(), |c| c.name.clone());
+        format!("Got advert from {name} [{key}]")
+    };
+    output::println(&msg);
+}
+
+/// Prints a note about a path update (`handle_path_update`).
+fn handle_path_update(app: &App, key: &str) {
+    let settings = app.settings().clone();
+    if !settings.print_path_updates {
+        return;
+    }
+    let msg = if settings.json_msgs {
+        dumps(&json!({"event": "path_update", "public_key": key}))
+    } else {
+        let name = app
+            .mc
+            .get_contact_by_key_prefix(key)
+            .map_or_else(|| "<Unknown Contact>".to_string(), |c| c.name.clone());
+        format!("Got path update for {name} [{key}]")
+    };
+    output::println(&msg);
+}
+
+/// Prints a note about a new pending contact (`handle_new_contact`).
+fn handle_new_contact(app: &App, contact: &Value) {
+    let settings = app.settings().clone();
+    if !settings.print_new_contacts {
+        return;
+    }
+    let msg = if settings.json_msgs {
+        dumps(&json!({"event": "new_contact", "contact": contact}))
+    } else {
+        format!(
+            "New pending contact {} [{}]",
+            vstr(contact, "adv_name"),
+            vstr(contact, "public_key")
+        )
+    };
+    output::println(&msg);
+}
+
+/// Starts the task that reacts to unsolicited events.
+pub fn spawn_event_task(app: Arc<App>) -> tokio::task::JoinHandle<()> {
+    let mut subscription = app.mc.subscribe();
+    tokio::spawn(async move {
+        while let Some(event) = subscription.recv().await {
+            match &event {
+                Event::Advertisement(key) => handle_advert(&app, &key.to_string()),
+                Event::PathUpdate(key) => handle_path_update(&app, &key.to_string()),
+                Event::NewContact(_) => handle_new_contact(&app, &to_value(&event)),
+                Event::RxLog(_) => handle_log_rx(&app, to_value(&event)),
+                Event::ContactMessage(_) | Event::ChannelMessage(_) | Event::ChannelData(_)
+                    if app.msgs_subscribed.load(Ordering::Relaxed) =>
+                {
+                    handle_message(&app, to_value(&event)).await;
+                    app.messages_shown.send_modify(|n| *n = n.wrapping_add(1));
+                }
+                _ => {}
+            }
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floats_like_python() {
+        assert_eq!(py_float(5.0), "5.0");
+        assert_eq!(py_float(12.25), "12.25");
+        assert_eq!(py_float(-3.5), "-3.5");
+        assert_eq!(py_number(&json!(7)), "7");
+        assert_eq!(py_number(&json!(7.0)), "7.0");
+    }
+
+    #[test]
+    fn slices_like_python() {
+        assert_eq!(slice_to("abcdef", 3), "abc");
+        assert_eq!(slice_to("abcdef", 10), "abcdef");
+        assert_eq!(slice_to("abcdef", 0), "");
+        assert_eq!(slice_to("abcdef", -2), "abcd");
+        assert_eq!(slice_to("abcdef", -9), "");
+        assert_eq!(slice_to("äöü", -1), "äö");
+    }
+
+    #[test]
+    fn type_names() {
+        assert_eq!(type_name(2), "REP");
+        assert_eq!(type_name(9), "t:9");
+        assert_eq!(type_name(-1), "t:-1");
+    }
 }

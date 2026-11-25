@@ -1,6 +1,8 @@
 # meshcore-cli-rs
 
-A Rust command-line interface to MeshCore companion radios over Serial/USB.
+Command line interface to MeshCore companion radios and repeaters, written in Rust.
+
+It is a port of [meshcore-cli](https://github.com/meshcore-dev/meshcore-cli), the Python reference, and runs on top of [meshcore-rs](https://github.com/chrstnwhlrt/meshcore-rs). Commands, chaining, chat mode and the output in text and JSON follow the reference, so scripts written for one work with the other.
 
 ## Disclaimer
 
@@ -12,357 +14,231 @@ A Rust command-line interface to MeshCore companion radios over Serial/USB.
 - Use at your own risk. The authors are not responsible for any damage to hardware, data loss, or other issues that may arise from using this software.
 - Protocol implementation is based on reverse engineering and may be incomplete or incorrect.
 
-## About
+## Status
 
-meshcore-cli-rs connects to your MeshCore companion radio node over Serial/USB and provides a terminal-based interface to interact with it. You can:
+The port follows meshcore-cli 1.6.10 (commit `34355c9` from 2026-11-11), with meshcore_py 2.3.19 as the reference for the protocol.
 
-- Send commands as CLI arguments (for scripting)
-- Use interactive mode with readline support and tab completion
-- Chain multiple commands in a single invocation
-- Output in human-readable or JSON format
+Devices are reached over a serial port (USB), TCP or BLE. BLE goes through BlueZ and is available on Linux only (feature `ble`, on by default); on other systems the BLE options are accepted and ignored.
 
-**Note**: This tool only works with companion radios (via Serial/USB). You cannot connect directly to a repeater's serial interface.
+Both CLIs were run with the same command lines against a simulated companion (over TCP and over a serial pseudo terminal), a simulated repeater console and a real companion radio with MeshCore firmware 1.18.0, over USB and over BLE. The outputs match, apart from the differences listed at the end of this file and values that change between two runs, like the battery voltage.
 
 ## Installation
 
-### From Source
+Rust 1.95 or newer is needed. On Linux the build needs `pkg-config` and the headers of libdbus for BLE through BlueZ, on Debian and Ubuntu `libdbus-1-dev`. `--no-default-features` builds without BLE and needs neither.
+
+```bash
+cargo install --git https://github.com/chrstnwhlrt/meshcore-cli-rs
+```
+
+Or from a checkout:
 
 ```bash
 git clone https://github.com/chrstnwhlrt/meshcore-cli-rs
 cd meshcore-cli-rs
 cargo build --release
+# binary: target/release/meshcore-cli-rs
 ```
 
-The binary will be at `target/release/meshcore-cli-rs`.
-
-### Using Nix
+With Nix:
 
 ```bash
+nix run github:chrstnwhlrt/meshcore-cli-rs -- -s /dev/ttyUSB0 infos
 nix build github:chrstnwhlrt/meshcore-cli-rs
-./result/bin/meshcore-cli-rs
+```
+
+On Linux the user needs access to the serial port, usually through the `dialout` group:
+
+```bash
+sudo usermod -a -G dialout $USER
+# log out and back in
 ```
 
 ## Usage
 
-```bash
-meshcore-cli-rs [OPTIONS] [COMMAND]
+```
+meshcore-cli-rs <args> <commands>
 ```
 
-### Options
+| Option | Meaning |
+|--------|---------|
+| `-a <address>`, `-d <name>` | BLE device: its address or a part of its name; without `-s` and `-t` the first MeshCore device found (or the last one used) is taken |
+| `-P` | pair with the BLE device, asks for its PIN |
+| `-f` | take the first BLE device found when connecting fails |
+| `-T <seconds>` | BLE scan time (default 2) |
+| `-s <port>[:opts]` | serial port, e.g. `/dev/ttyUSB0`; options are comma separated: `baud=`, `dtr=`, `rts=` |
+| `-b <baudrate>` | baud rate (default 115200) |
+| `-t <hostname>` | connect over TCP |
+| `-p <port>` | TCP port (default 5000) |
+| `-l` | list BLE devices and serial ports and exit |
+| `-S` | choose a BLE device or serial port from a list |
+| `-r` | repeater mode: text console of a repeater, use with `-s` |
+| `-j` | JSON output (the init script is not run) |
+| `-i` | go to chat mode after the commands |
+| `-c <on/off>` | colors |
+| `-C` | toggle the classic prompt |
+| `-q` | quiet, only errors are logged |
+| `-D` | debug logging |
+| `-v` | version |
+| `-h` | help for arguments and commands |
 
-| Option | Description |
-|--------|-------------|
-| `-s <PORT>` | Serial port to use (e.g., `/dev/ttyUSB0`) |
-| `-b <BAUD>` | Baud rate (default: 115200) |
-| `-j` | JSON output mode (disables init scripts) |
-| `-D` | Enable debug logging |
-| `-l` | List available serial ports and exit |
-| `-c <on/off>` | Enable/disable colored output |
-
-### Configuration
-
-Configuration files are stored in `~/.config/meshcore/`:
-
-- `init` - Global init script, executed before commands
-- `<device-name>.init` - Per-device init script (useful for setting contact timeouts)
-- Command history is preserved between sessions
-
-## Commands Reference
-
-### General Commands
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `chat` | `interactive`, `im` | Enter interactive chat mode |
-| `chat_to <contact>` | `to`, `imto` | Enter chat with specific contact |
-| `script <file>` | | Execute commands from file |
-| `infos` | `i` | Print device information |
-| `self_telemetry` | `t` | Print own telemetry data |
-| `card` | `e` | Export this node's URI (contact card) |
-| `ver` | `v`, `q` | Print firmware version |
-| `reboot` | | Reboot the device |
-| `sleep <secs>` | `s` | Sleep for given duration |
-| `wait_key` | `wk` | Wait until user presses Enter |
-| `apply_to <filter> <cmds>` | `at` | Apply commands to matching contacts |
-
-### Messaging Commands
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `msg <name> <text>` | `m` | Send private message |
-| `wait_ack [timeout]` | `wa` | Wait for acknowledgment |
-| `chan <n> <text>` | `ch` | Send message to channel number |
-| `public <text>` | `dch` | Send to public channel (0) |
-| `recv` | `r` | Read next message |
-| `wait_msg [timeout]` | `wm` | Wait for a message |
-| `sync_msgs` | `sm` | Get all unread messages |
-| `trywait_msg <timeout>` | `wmt` | Try wait for message with timeout |
-| `msgs_subscribe` | `ms` | Display messages as they arrive |
-| `get_channels` | `gc` | Print all channel info |
-| `get_channel <n>` | | Get channel by number/name |
-| `set_channel <n> <name> [key]` | | Set channel configuration |
-| `remove_channel <n>` | | Remove a channel |
-| `add_channel <name> [key]` | | Add channel to first free slot |
-| `scope <topic>` | | Set flood scope |
-
-### Device Management
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `advert` | `a` | Send advertisement |
-| `floodadv` | | Send flood advertisement |
-| `get <param>` | | Get device parameter |
-| `set <param> <value>` | | Set device parameter |
-| `time <epoch>` | | Set device time |
-| `clock [--sync]` | | Get/sync device clock |
-| `sync_time` | `st` | Sync device clock to system |
-| `node_discover [filter]` | `nd` | Discover nodes by type |
-| `battery` | | Get battery status |
-| `stats [core/radio/packets]` | | Get device statistics |
-
-### Contact Commands
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `contacts` / `list` | `lc` | Get contact list |
-| `reload_contacts` | `rc` | Force reload all contacts |
-| `contact_info <ct>` | `ci` | Print contact information |
-| `contact_timeout <ct> <secs>` | | Set temporary timeout for contact |
-| `share_contact <ct>` | `sc` | Share contact with others |
-| `export_contact [ct]` | `ec` | Get contact's URI (or self) |
-| `import_contact <uri>` | `ic` | Import contact from URI |
-| `remove_contact <ct>` | | Remove a contact |
-| `path <ct>` | | Display path to contact |
-| `disc_path <ct>` | `dp` | Discover and display new path |
-| `reset_path <ct>` | `rp` | Reset path to flood |
-| `change_path <ct> <path>` | `cp` | Change path to contact |
-| `change_flags <ct> <flags>` | `cf` | Change contact flags |
-| `req_telemetry <ct>` | `rt` | Request telemetry from contact |
-| `req_mma <ct>` | `rm` | Request min/max/avg data |
-| `req_acl <ct>` | | Request access control list |
-| `pending_contacts` | | Show pending contacts |
-| `add_pending <key>` | | Add pending contact |
-| `flush_pending` | | Flush pending contact list |
-
-### Repeater Commands
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `login <name> <pwd>` | `l` | Login to repeater |
-| `logout <name>` | | Logout from repeater |
-| `cmd <name> <cmd>` | `c` | Send command to repeater |
-| `wmt8` | | Wait for message (8s timeout) |
-| `req_status <name>` | `rs` | Request status from node |
-| `req_neighbours <name>` | `rn` | Request neighbours list |
-| `req_binary <name> <hex>` | `rb` | Send raw binary request |
-| `trace <path>` | `tr` | Run trace through path |
-
-### Advanced Commands
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `export_key` | | Export private key |
-| `import_key <hex>` | | Import private key |
-| `get_vars` | | Get custom variables |
-| `set_var <key> <value>` | | Set custom variable |
-
-## Interactive Mode
-
-Interactive mode (chat) provides a readline-like experience with:
-
-- Command history (up/down arrows)
-- Tab completion for commands and contacts
-- Color-coded output
-- Contact switching with `to` command
-
-### Interactive Commands
-
-```
-to <dest>     # Switch to contact or channel
-to /          # Go to root (your node)
-to ~          # Go to root (alias)
-to ..         # Switch to previous contact
-to !          # Switch to last message sender
-/<cmd>        # Execute command on root
-/<dest>/<cmd> # Execute command on specific dest
-/<dest> <msg> # Send message to dest
-quit / q      # Exit interactive mode
-```
-
-### Contact Types in Interactive Mode
-
-- **Chat nodes**: Sending text sends a message by default
-- **Repeaters/Rooms**: Text is sent as commands; prefix with `"` for messages
-
-## Apply To (Batch Commands)
-
-The `apply_to` command executes commands on contacts matching a filter:
+Commands can be chained, each one takes the arguments it needs:
 
 ```bash
-meshcore-cli-rs -s /dev/ttyUSB0 apply_to "t=2,d" "login password"
+meshcore-cli-rs -s /dev/ttyUSB0 sync_time msg Alice "hello" wait_ack
+meshcore-cli-rs -t 192.168.1.20 -j get bat get radio
 ```
 
-### Filter Syntax
+`-h` lists all commands with their short forms. `?<cmd>` explains a command in more detail, `get help` and `set help` list the parameters.
 
-| Filter | Description |
-|--------|-------------|
-| `t=<n>` | Type: 1=client, 2=repeater, 3=room, 4=sensor |
-| `h<>n` | Hop count comparison (e.g., `h>2`, `h<0`, `h=1`) |
-| `d` | Direct contacts only (equivalent to `h>-1`) |
-| `f` | Flood contacts only (equivalent to `h<0`) |
-| `u<>time` | Updated before/after time (supports `d`, `h`, `m` suffixes) |
-
-### Examples
+Some examples:
 
 ```bash
-# Remove clients not updated in 2 days
-meshcore-cli-rs apply_to "u<2d,t=1" remove_contact
-
-# Login to all direct repeaters updated in last 24h
-meshcore-cli-rs apply_to "t=2,u>1d,d" "login password"
-
-# Reset path for all flood repeaters
-meshcore-cli-rs apply_to "t=2,f" reset_path
+meshcore-cli-rs -d MyNode infos                    # BLE, device name contains MyNode
+meshcore-cli-rs -s /dev/ttyUSB0 infos              # node information (json)
+meshcore-cli-rs -s /dev/ttyUSB0 lc                 # contact list
+meshcore-cli-rs -s /dev/ttyUSB0 sync_msgs          # read waiting messages
+meshcore-cli-rs -s /dev/ttyUSB0 login Rep1 '$' rs Rep1   # '$' asks for the password
+meshcore-cli-rs -s /dev/ttyUSB0 trace 5f,7c        # trace along two hops
+meshcore-cli-rs -s /dev/ttyUSB0 apply_to "t=2,u>1d,d" "cn trace"
 ```
 
-## Examples
+`apply_to` takes the filter and the commands as two arguments, so both need quotes in a shell when they contain spaces or `>`.
 
-### Get Device Info
+### JSON
+
+With `-j` every command prints JSON formatted like Python's `json.dumps` in the reference: same key order, `", "` and `": "` as separators, non-ASCII characters escaped. A command prefixed with a dot (`.get bat`) prints JSON once, without `-j`.
+
+### Chat mode
+
+Chat mode starts when no command is given, with `-i`, or when the last argument is `chat`, `im` or `interactive`. Lines are parsed like the reference does it:
+
+| Input | Meaning |
+|-------|---------|
+| `to <name>` | go to a contact or channel (`to public`, `to ch1`, `to #test`) |
+| `to <name>%<scope>` | the same, with a flood scope |
+| `to ..`, `to ~`, `to !` | previous recipient, back to the node, sender of the last message |
+| text | message to the current contact or channel; at a repeater, room or sensor it is sent as a command, `send <text>` or a leading `"` sends a message instead |
+| `/<cmd>`, `/<name>/<cmd>`, `/<name> <text>` | command at node level, command or message for another contact |
+| `!<text>` | reply to the last received message |
+| `$$<cmds>` | run the line like command line arguments |
+| `:<cmd>` | at node level: run a CLI command on the device |
+| `@<alias> <args>` | run an alias, see `?alias` |
+| `> file <line>`, `>> file <line>` | write or append the output to a file |
+| `\|<command> <line>` | send the output to a shell command |
+| `<key\| <command> <line>` | run the command and put its output in place of `{key}` in the line (`<\|` for `{}`) |
+| `a \| b` | run `a`, then `b` |
+
+Tab completes commands, contacts and parameters. The history is kept in `~/.config/meshcore/history`, in the same format as the Python CLI, so both share it. `quit`, `q` or Ctrl+D leave chat mode.
+
+### Handlers
+
+`handler_attach <type> <command>` starts a command and writes every event of the type (`rxlog`, `msgs` or `chan_data`) as one JSON line to its stdin. What the command prints is shown. `handlers` lists the handlers, `handler_detach <n>` stops one.
 
 ```bash
-$ meshcore-cli-rs -s /dev/ttyUSB0 infos
-Name: MyNode
-Public Key: 993acd42fc779962c68c627829b32b111fa27a67d86b75c17460ff48c3102db4
-TX Power: 22 dBm
-Location: 47.794000, -3.428000
-Radio: 869.525 MHz, BW 250kHz, SF11, CR 4/5
+meshcore-cli-rs -s /dev/ttyUSB0 handler_attach rxlog "jq -c .payload_typename" chat
 ```
 
-### JSON Output
+### Repeater mode
+
+`-r` talks to the text console on a repeater's serial port:
 
 ```bash
-$ meshcore-cli-rs -s /dev/ttyUSB0 -j infos
-{
-  "name": "MyNode",
-  "public_key": "993acd42...",
-  "tx_power": 22,
-  ...
-}
+meshcore-cli-rs -r -s /dev/ttyUSB0 get radio     # one command
+meshcore-cli-rs -r -s /dev/ttyUSB0               # interactive console
 ```
 
-### Send and Wait for ACK
+Besides the commands of the repeater firmware, the console knows `clock sync` (also `st` and `sync_time`, sets the repeater clock to the local time), `region download [file]`, `region upload [file]`, `script <file>` and `help`. The history is kept in `~/.config/meshcore/repeater_history`.
+
+## Configuration
+
+Everything lives in `~/.config/meshcore/` on all platforms. Files are only written when that directory exists (`mkdir -p ~/.config/meshcore`).
+
+| File | Content |
+|------|---------|
+| `init` | commands run after connecting (not with `-j`) |
+| `<node name>.init` | commands run after connecting to this node |
+| `history`, `repeater_history`, `region_files_history` | input histories |
+| `<node name>.msgs` | received and sent messages, one JSON object per line |
+| `<public key>.pass` | password saved by `login` in chat mode, removed by `forget_password` (`fp`) |
+| `scopes` | flood scope per channel, one `<channel name> <scope>` per line |
+| `default_address` | address of the last BLE device, used when no device is given |
+
+`aliases_load <file>` reads aliases from a JSON object of names and values.
+
+## Differences to the Python reference
+
+BLE works on Linux only, through BlueZ. `-P` asks for the PIN in the terminal; in the reference it starts the pairing and the system's Bluetooth agent asks for the PIN.
+
+Fixed in this port, where the reference fails or prints wrong data:
+
+- `path <ct>` with `-j` fails in the reference (it reads `out_path_hash_len`, which contacts do not have); here it prints the hash size in bytes under that name. Without `-j` the reference prints no newline after the path, so chained output runs together.
+- `req_binary` calls a function meshcore_py does not have; here it sends the request and prints the answer.
+- A trace to a contact (`trace` and `dtrace` in chat mode) uses the path hash size of the contact instead of the node setting, and 3-byte hashes are no longer reversed twice.
+- `sync_msgs` does not stop at hidden channel data, `apply_to ... send` no longer changes the text for the following contacts, and the completion of sensor commands no longer changes the one of repeaters.
+- `node_discover` collects every answer. The reference waits anew after each answer and can miss one that arrives right after it. It also checks for known contacts before loading them, so on the command line `add_discovered -a` adds known repeaters again under their key prefix; here the contacts are loaded first.
+- Repeater mode keeps the case of file names and takes the rest of the line as the name, so it may contain spaces; the reference lowercases the name and takes only one word. It also does not crash when the port cannot be opened.
+- A repeater mode script that runs another script goes on after it. The reference always stops it there with "Error during script execution, exiting", even when the inner script ran without error.
+- `-c off` also removes the colors of channel data messages, channel and advert echoes and the repeater console.
+- `to <name>` also finds channels whose name starts with "ch"; the reference reads every such name as a channel number and fails.
+- A channel argument made of numeric characters that are not digits (like `三` or `½`) is a channel name. The reference takes it for a number and fails.
+- `set telemetry_mode_base` accepts every word starting with "dev", like the location and environment modes; the reference only takes "dev" there.
+- Contacts and adverts of a type above 4 show as `t:<type>`, as `node_discover` shows them. The reference fails there with a Python error: in `lc`, in `contact_type` in chat mode and in advert echoes, which then also skip `json_log_rx` and the handlers.
+- `change_flags` reports "Error setting flags" instead of "Error setting path".
+- `change_path` reports a hash mode below 0 (a first hash of one digit gives -1) or above 3 as an error; the reference fails there with a Python error.
+- `reset_advert_time` with an unknown contact says so; the reference fails with a Python error.
+- `get custom` and `get <variable>` with `-j` print a failed request as `{"error": ...}`; the reference fails with a Python error.
+- `set tx` takes values up to 127. The reference sends larger ones too, and the device reads only their lowest byte, so 276 sets 20 dBm.
+- `set radio` rounds the frequency to whole kHz and the bandwidth to whole Hz. The reference cuts off the rest after a float multiplication, so it sets 869.462 MHz for 869.4625 and 512.001 MHz for 512.002.
+- `add_contact` with a key that is not 32 bytes long reports the command format. The reference sends it, and the device reads the fields after the key into it.
+- After `reset_path` a contact reads `"out_path_hash_mode": -1` like one the device reports without a path; the reference keeps the old mode in its copy of the contact until the contacts are loaded again.
+- `lc` adds the distances (`d` in the format or the sort order) to its own output only. The reference also stores them in its contacts, so they show up in later JSON of the same run (`contact_info`, `lc -j`).
+- An `@alias` line with an unclosed quote is reported; the reference ends chat mode with a traceback.
+- A line of the `scopes` file that is not `<channel> <scope>` is reported as an error. The reference means to do that too, but its message is lost because logging is set up only after the file is read.
+- A `scopes` file, repeater mode script or region file that cannot be read or is not UTF-8 is reported as an error. The reference fails with a Python error, for `scopes` at every start and for a region file that is not UTF-8 after it sent part of it.
+- Typos and invisible non-breaking spaces in help texts and output are fixed, and the help lists all commands and parameters. It no longer offers `e` as short form of `card`, which the reference lists but does not know.
+
+Behaves differently on purpose:
+
+- A wrong password is reported at once ("Login failed"). meshcore_py waits for the timeout, because it only listens for a successful login.
+- `msgs_subscribe` and chat mode fetch all waiting messages and show them before the next command runs. meshcore_py fetches one and leaves the rest until the device announces new messages.
+- `sleep` and `trywait_msg` accept fractions of seconds, and `get max_attempts` exists next to `set max_attempts`.
+- Whole numbers beyond 64 bits are refused with "int too big to convert". Python reads them and fails only when it packs them for the device, partly with another message, or takes them as they are, for example as a retry count.
+- `-D` keeps debug logging with `-j` and `-q`; the reference switches back to errors only once it is connected.
+- Wrong options, failed connections and init scripts that cannot be read end with exit code 1 and the message of the reference; the reference ends with 0, after a failed connection or script also with a Python traceback.
+- `-l` prints "No ble device found" when no MeshCore device is in range. The reference prints it only when it sees no Bluetooth device at all.
+- A BLE device that another program on this computer is using is reported as in use after about 3 s. The reference tries to connect for 30 s, then scans for the device and reports that it cannot find it, since a connected device does not advertise.
+- Device errors read like `device error 6 (ERR_CODE_ILLEGAL_ARG)` instead of a Python object, and `handlers` leaves out internal Python objects.
+- Input the device cannot take whole is refused with the reason before anything is sent, also in chat mode: a text over 160 bytes (on a channel including the node name and ": "), a command over 176 bytes, a login password over 15 bytes, an empty message, node name or CLI command, a NUL character in a text or name, a `:` in the name of a custom variable, a private key that is not 64 bytes long, a contact card under 98 bytes, a raw packet under 2 bytes, a trace without hops, a path that is not a whole number of hops, a path over 63 hops or 64 bytes, a path hash mode above 2 (mode 3 is reserved) and coordinates beyond 90 degrees latitude or 180 degrees longitude. The reference sends it, and the device rejects it (a too long direct message with ERR_CODE_TABLE_FULL, coordinates with ERR_CODE_ILLEGAL_ARG, the short or empty ones as an unknown command), cuts it short or reads it differently. Apart from the private key, meshcore-rs makes these checks, and its README lists them. They assume companion firmware 1.16 or newer; older firmware takes frames of 172 instead of 176 bytes, so there a direct message or a command to a node holds at most 159 bytes.
+- Further details follow meshcore-rs, whose README lists where it differs from meshcore_py: for example `reload_contacts` forgets contacts removed on the device, and names longer than the 31 bytes the device keeps are cut at a character boundary.
+- The JSON of `req_neighbours` has no empty line after it.
+- The line editor is rustyline instead of prompt_toolkit: Tab prints the candidates instead of opening a menu and completes the whole word before the cursor, where prompt_toolkit only looks at the part after a character like `.` or `-`, and `-S` shows a numbered list instead of a dialog. Tab also offers the commands and settings the reference leaves out of its completion, like `sync_msgs`, `recv` or `set arrow_head`. With input from a pipe or a file no prompt is printed; prompt_toolkit prints its prompts with the lines it reads and warns that the input is not a terminal.
+
+## Development
 
 ```bash
-$ meshcore-cli-rs -s /dev/ttyUSB0 msg Alice "Hello!" wait_ack
-Message sent (ack: 4802ed93)
-Message acknowledged!
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo fmt --check
+nix flake check        # package, clippy, rustfmt and tests
 ```
 
-### Sync Clock and Verify
+To build against a local checkout of meshcore-rs:
 
 ```bash
-$ meshcore-cli-rs -s /dev/ttyUSB0 sync_time clock
-Clock synchronized
-Current time: 2026-01-01 12:00:00 (1735732800)
+cargo build --config 'patch."https://github.com/chrstnwhlrt/meshcore-rs".meshcore.path="../meshcore-rs"'
 ```
-
-### List Contacts
-
-```bash
-$ meshcore-cli-rs -s /dev/ttyUSB0 contacts
-Contacts (15):
-  Alice          a1b2c3d4e5f6  [D:2]  47.80,-3.43
-  Bob_Repeater   b2c3d4e5f6a1  [F]    48.12,-2.98
-  Room_Server    c3d4e5f6a1b2  [D:1]  -
-```
-
-### Interactive Session
-
-```bash
-$ meshcore-cli-rs -s /dev/ttyUSB0 chat
-MyNode> to Alice
-Alice> Hello there!
-Alice(D): Hi! How are you?
-Alice> I'm good, thanks!
-Alice(D): Great to hear!
-Alice> to Bob_Repeater
-Bob_Repeater> clock
-Bob_Repeater(0): 12:00 - 1/1/2026 UTC
-Bob_Repeater> quit
-$
-```
-
-### Script Execution
-
-```bash
-$ cat commands.txt
-sync_time
-advert
-contacts
-
-$ meshcore-cli-rs -s /dev/ttyUSB0 script commands.txt
-Clock synchronized
-Advertisement sent
-Contacts (15):
-...
-```
-
-## Get/Set Parameters
-
-### Get Parameters
-
-```bash
-meshcore-cli-rs get help              # List all parameters
-meshcore-cli-rs get name              # Device name
-meshcore-cli-rs get coords            # GPS coordinates
-meshcore-cli-rs get tx_power          # TX power in dBm
-meshcore-cli-rs get radio             # Radio configuration
-meshcore-cli-rs get telemetry_mode    # Telemetry settings
-```
-
-### Set Parameters
-
-```bash
-meshcore-cli-rs set name "MyDevice"
-meshcore-cli-rs set coords 47.5,8.5
-meshcore-cli-rs set tx_power 20
-meshcore-cli-rs set radio 869.525,250,11,5
-meshcore-cli-rs set manual_add_contacts on
-```
-
-## Requirements
-
-- Rust 1.85+ (Edition 2024)
-- Serial/USB access to MeshCore companion device
-- Linux/macOS/Windows (with appropriate serial port permissions)
-
-### Linux Serial Permissions
-
-On Linux, add your user to the `dialout` group:
-
-```bash
-sudo usermod -a -G dialout $USER
-# Log out and back in for changes to take effect
-```
-
-## Dependencies
-
-This CLI uses [meshcore-rs](https://github.com/chrstnwhlrt/meshcore-rs) as the underlying library.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file.
+MIT License, see [LICENSE](LICENSE).
 
 ## Related Projects
 
-- [meshcore-rs](https://github.com/chrstnwhlrt/meshcore-rs) - Rust library (dependency)
-- [meshcore-cli](https://github.com/meshcore-dev/meshcore-cli) - Original Python CLI (reference implementation)
-- [meshcore_py](https://github.com/fdlamotte/meshcore_py) - Original Python library
-
-## Contributing
-
-Contributions are welcome! Please note that this is an independent community project.
+- [meshcore-rs](https://github.com/chrstnwhlrt/meshcore-rs): the Rust library this CLI uses
+- [meshcore-cli](https://github.com/meshcore-dev/meshcore-cli): the Python CLI this port follows
+- [meshcore_py](https://github.com/meshcore-dev/meshcore_py): the Python library behind it
 
 ## Acknowledgments
 
-This project is inspired by and based on [meshcore-cli](https://github.com/meshcore-dev/meshcore-cli) by fdlamotte and the meshcore-dev community.
+This project is based on [meshcore-cli](https://github.com/meshcore-dev/meshcore-cli) by fdlamotte and the meshcore-dev community.

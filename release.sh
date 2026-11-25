@@ -24,8 +24,8 @@ echo "$current -> $new"
 # Update Cargo.toml
 sed -i "s/^version = \"$current\"/version = \"$new\"/" "$CARGO_TOML"
 
-# Update Cargo.lock
-cargo generate-lockfile --quiet
+# Update the version in Cargo.lock; the dependencies stay as tested
+cargo update --workspace --quiet
 
 # Commit and tag
 git add "$CARGO_TOML" Cargo.lock
