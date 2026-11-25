@@ -161,7 +161,7 @@ pub async fn process_contact_chat_line(
     {
         let scope = scope.to_string();
         line = cmd.to_string();
-        app.set_scope(&scope).await;
+        app.set_scope(Some(&scope)).await;
     }
 
     if let Some(cmd) = line.strip_prefix(':') {
@@ -370,7 +370,7 @@ pub async fn process_contact_chat_line(
         if let Some((cmd, scope)) = first.rsplit_once('%') {
             let scope = scope.to_string();
             first = cmd.to_string();
-            app.set_scope(&scope).await;
+            app.set_scope(Some(&scope)).await;
         }
         if matches!(
             first.as_str(),
@@ -652,9 +652,7 @@ pub async fn apply_command_to_contacts(
             let args = vec![line.to_string(), contact.name.clone()];
             Box::pin(process_cmds(app, &args, json, &mut buffer, "")).await;
         } else if line.starts_with("send") || line.starts_with('"') {
-            let text = line.strip_prefix("send").map_or(line, |rest| {
-                crate::util::py::strip(rest.get(1..).unwrap_or_default())
-            });
+            let text = crate::util::text::send_text(line).unwrap_or(line);
             super::chat_msg(
                 app,
                 &Recipient::Contact(Box::new(contact.clone())),
@@ -662,7 +660,8 @@ pub async fn apply_command_to_contacts(
                 &mut buffer,
                 "",
             )
-            .await;
+            .await
+            .map_err(FilterError::Raised)?;
         } else if matches!(contact_type(&contact), 2..=4) {
             let args = vec!["cmd".to_string(), contact.name.clone(), line.to_string()];
             Box::pin(process_cmds(app, &args, json, &mut buffer, "")).await;

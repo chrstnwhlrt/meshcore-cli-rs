@@ -67,7 +67,7 @@ pub enum AttachError {
 /// The error of starting a program with an empty name the way Python's
 /// `subprocess` does: it tries `<dir>/` for each directory of `PATH`, and
 /// exec refuses a directory, where exec would call the empty name missing.
-fn empty_program_error() -> std::io::Error {
+pub fn empty_program_error() -> std::io::Error {
     let path = std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".to_string());
     let separator = if cfg!(windows) { ';' } else { ':' };
     if path

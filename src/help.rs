@@ -389,7 +389,7 @@ Example:
 Track-R|*> trace 6a61
  →13.25→[6a]→12.50→[61]→13.50→
 
-At the beginning hashes were only 1 byte long. But with firmware after 1.12 you can use multi byte paths (2 bytes long and 4 bytes long hashes). The flag specifying the size of the hashes will either be guessed from the size of the tokens when used with commas, or specified using a colon (0: 1 byte, 1: 2 bytes, 3: 4 bytes), so AAAA,BBBB or AAAABBBB:1 are equivalent. When there is only one repeater on the path, you can put a comma at the end of the path to get the hash size right.
+At the beginning hashes were only 1 byte long. But with firmware after 1.12 you can use multi byte paths (2 bytes long and 4 bytes long hashes). The flag specifying the size of the hashes will either be guessed from the size of the tokens when used with commas, or specified using a colon (0: 1 byte, 1: 2 bytes, 2: 4 bytes), so AAAA,BBBB or AAAABBBB:1 are equivalent. When there is only one repeater on the path, you can put a comma at the end of the path to get the hash size right.
 
 Here are some examples :
 

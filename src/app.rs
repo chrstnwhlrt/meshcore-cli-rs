@@ -90,12 +90,13 @@ pub struct Settings {
     pub lc_output_format: String,
     /// Default sort order of `lc`.
     pub lc_sort_order: String,
-    /// Attempts when sending chat messages (`max_attempts`).
-    pub max_attempts: u32,
+    /// Attempts when sending chat messages (`max_attempts`). The counts
+    /// are kept as given, negative or large, as the reference keeps them.
+    pub max_attempts: i64,
     /// Attempt after which the message goes flood (`flood_after`).
-    pub flood_after: u32,
+    pub flood_after: i64,
     /// Attempts in flood mode (`max_flood_attempts`).
-    pub max_flood_attempts: u32,
+    pub max_flood_attempts: i64,
 }
 
 impl Default for Settings {
@@ -215,7 +216,8 @@ pub struct State {
     pub scopes: HashMap<String, String>,
     /// True once the device reported that it has no scopes.
     pub no_scope: bool,
-    /// Scope currently set on the device.
+    /// Scope currently set on the device (`None` before the first one and
+    /// after a reset to the reference's `None`).
     pub current_scope: Option<String>,
     /// Channel slots, fetched on first use.
     pub channels: Option<Vec<ChannelEntry>>,
@@ -409,14 +411,16 @@ impl App {
         value
     }
 
-    /// Timeout set with `contact_timeout` (None = suggested timeout).
+    /// Timeout set with `contact_timeout` (None = suggested timeout). As in
+    /// `meshcore_py`, 0 stands for the suggested timeout, and a negative or
+    /// NaN value for none at all: the wait for the answer ends at once.
     #[must_use]
     pub fn timeout_for(&self, key: &PublicKey) -> Option<Duration> {
         self.state()
             .timeouts
             .get(&key.to_string())
             .copied()
-            .filter(|t| *t > 0.0)
+            .filter(|t| *t != 0.0)
             .map(crate::util::time::duration_from_secs)
     }
 
@@ -488,24 +492,34 @@ impl App {
 
     /// Sets the flood scope (`set_scope`).
     ///
-    /// `"None"`, `"0"`, `"clear"` and `""` select the default scope. Returns
-    /// the active scope, or `None` when scopes are unsupported or failed.
-    pub async fn set_scope(&self, scope: &str) -> Option<String> {
+    /// `"None"`, `"0"`, `"clear"` and `""` select the default scope. `None`
+    /// stands for the reference's `None`, the scope a failed change leaves
+    /// in the chat: unless the current scope is `None` already, the device
+    /// goes back to its default scope and `None` becomes the current scope.
+    /// Returns the active scope, or `None` when scopes are unsupported or
+    /// failed.
+    pub async fn set_scope(&self, scope: Option<&str>) -> Option<String> {
         if self.state().no_scope {
             return None;
         }
-        let scope = if matches!(scope, "None" | "0" | "clear" | "") {
-            ""
-        } else {
-            scope
-        };
-        if self.state().current_scope.as_deref() == Some(scope) {
-            return Some(scope.to_string());
+        let scope = scope.map(|scope| {
+            if matches!(scope, "None" | "0" | "clear" | "") {
+                ""
+            } else {
+                scope
+            }
+        });
+        if self.state().current_scope.as_deref() == scope {
+            return scope.map(str::to_string);
         }
-        match self.mc.set_flood_scope_str(scope).await {
+        let result = match scope {
+            Some(scope) => self.mc.set_flood_scope_str(scope).await,
+            None => self.mc.reset_flood_scope().await,
+        };
+        match result {
             Ok(()) => {
-                self.state().current_scope = Some(scope.to_string());
-                Some(scope.to_string())
+                self.state().current_scope = scope.map(str::to_string);
+                scope.map(str::to_string)
             }
             Err(meshcore::Error::Device(code)) => {
                 if code == meshcore::ErrorCode::UnsupportedCmd {
@@ -518,13 +532,18 @@ impl App {
     }
 
     /// Appends a message to the message log (`log_message`).
-    pub fn log_message(&self, mut msg: Value) {
+    ///
+    /// # Errors
+    ///
+    /// The text of the `OSError` when the log cannot be written, which ends
+    /// the command or the event handler in the reference.
+    pub fn log_message(&self, mut msg: Value) -> Result<(), String> {
         let Some(file) = self.state().message_log.clone() else {
-            return;
+            return Ok(());
         };
         let kind = vstr(&msg, "type");
         if kind.is_empty() || kind == "DATA" {
-            return;
+            return Ok(());
         }
         if let Value::Object(map) = &mut msg {
             if kind == "PRIV" {
@@ -550,11 +569,13 @@ impl App {
             );
         }
         let line = format!("{}\n", crate::util::json::dumps(&msg));
-        let _ = std::fs::OpenOptions::new()
+        let mut log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(file)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+            .open(&file)
+            .map_err(|e| crate::util::py::os_error(&e, Some(&file.display().to_string())))?;
+        std::io::Write::write_all(&mut log, line.as_bytes())
+            .map_err(|e| crate::util::py::os_error(&e, None))
     }
 }
 

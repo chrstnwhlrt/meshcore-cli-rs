@@ -5,8 +5,9 @@ use serde_json::{Value, json};
 use super::{CmdError, CmdResult, Ctx};
 
 /// Seconds given to `sleep` and `trywait_msg`: the reference takes
-/// `int(value)`; fractions are accepted here too, anything else fails with
-/// the message of `int()`.
+/// `int(value)`; fractions are accepted here too, anything else (also
+/// `nan` and `inf`, which `float()` reads) fails with the message of
+/// `int()`.
 ///
 /// # Errors
 ///
@@ -15,7 +16,10 @@ pub fn seconds(text: &str) -> Result<f64, CmdError> {
     match crate::util::py::int(text, 10) {
         #[allow(clippy::cast_precision_loss)]
         Ok(secs) => Ok(secs as f64),
-        Err(int_error) => crate::util::py::float(text).map_err(|_| CmdError::Failed(int_error)),
+        Err(int_error) => crate::util::py::float(text)
+            .ok()
+            .filter(|secs| secs.is_finite())
+            .ok_or(CmdError::Failed(int_error)),
     }
 }
 
@@ -163,4 +167,21 @@ pub async fn handler_detach(c: &mut Ctx<'_>) -> CmdResult {
         Err(e) => return Err(CmdError::Failed(e)),
     }
     Ok(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seconds_like_int_with_fractions() {
+        assert_eq!(seconds("3").ok(), Some(3.0));
+        assert_eq!(seconds(" 0.5 ").ok(), Some(0.5));
+        for text in ["nan", "inf", "-Infinity", "x"] {
+            assert!(
+                matches!(seconds(text), Err(CmdError::Failed(m)) if m.starts_with("invalid literal for int()")),
+                "{text}"
+            );
+        }
+    }
 }

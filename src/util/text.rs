@@ -40,6 +40,17 @@ pub fn split_pipeline(pipeline: &str) -> Vec<String> {
     lines
 }
 
+/// The text of a `send` line, taken like the reference's
+/// `line[5:].strip()`: the character after "send" is dropped, whatever it
+/// is, and the rest is stripped. `None` when the line does not start with
+/// "send".
+#[must_use]
+pub fn send_text(line: &str) -> Option<&str> {
+    let mut rest = line.strip_prefix("send")?.chars();
+    rest.next();
+    Some(crate::util::py::strip(rest.as_str()))
+}
+
 /// Removes one pair of matching outer quotes (`strip_outer_quotes`).
 #[must_use]
 pub fn strip_outer_quotes(text: &str) -> &str {
@@ -695,6 +706,16 @@ mod tests {
         assert_eq!(strip_outer_quotes("'hi'"), "hi");
         assert_eq!(strip_outer_quotes("\"hi'"), "\"hi'");
         assert_eq!(strip_outer_quotes("\""), "\"");
+    }
+
+    #[test]
+    fn send_lines_drop_one_character() {
+        // line[5:].strip(): one character after "send", whatever it is
+        assert_eq!(send_text("send hi"), Some("hi"));
+        assert_eq!(send_text("send\u{e9} hi"), Some("hi"));
+        assert_eq!(send_text("sendXhi"), Some("hi"));
+        assert_eq!(send_text("send"), Some(""));
+        assert_eq!(send_text("other"), None);
     }
 
     #[test]

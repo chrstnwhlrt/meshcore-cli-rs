@@ -11,8 +11,31 @@ use super::{CmdError, CmdResult, Ctx};
 use crate::app::{App, to_value};
 use crate::display::format_message;
 
+/// Why a message was not sent, or not logged.
+#[derive(Debug)]
+pub enum SendError {
+    /// Sending failed.
+    Send(meshcore::Error),
+    /// The message went out, but the message log could not be written: the
+    /// text of the `OSError`, with which the reference fails after sending.
+    Log(String),
+}
+
+impl From<meshcore::Error> for SendError {
+    fn from(e: meshcore::Error) -> Self {
+        Self::Send(e)
+    }
+}
+
 /// Adds the fields of a sent message and writes it to the message log.
-fn log_sent(app: &App, mut sent: Value, kind: &str, recipient: &str, text: &str, txt_type: u8) {
+fn log_sent(
+    app: &App,
+    mut sent: Value,
+    kind: &str,
+    recipient: &str,
+    text: &str,
+    txt_type: u8,
+) -> Result<(), SendError> {
     if let Value::Object(map) = &mut sent {
         map.insert("type".into(), json!(kind));
         map.insert("recipient".into(), json!(recipient));
@@ -21,7 +44,7 @@ fn log_sent(app: &App, mut sent: Value, kind: &str, recipient: &str, text: &str,
         map.insert("sender".into(), json!(app.self_name()));
         map.insert("name".into(), json!(recipient));
     }
-    app.log_message(sent);
+    app.log_message(sent).map_err(SendError::Log)
 }
 
 /// Where a direct message goes: a contact or a raw key prefix.
@@ -51,11 +74,11 @@ fn c_prefix(bytes: &[u8]) -> [u8; 6] {
 }
 
 /// Sends a message without waiting (`send_msg`); logs it on success.
-pub async fn send_msg(app: &App, to: &Recipient, text: &str) -> Result<Value, meshcore::Error> {
+pub async fn send_msg(app: &App, to: &Recipient, text: &str) -> Result<Value, SendError> {
     let sent = app.mc.send_msg(to.destination(), text, None, 0).await?;
     let value = to_value(&sent);
     if let Recipient::Contact(contact) = to {
-        log_sent(app, value.clone(), "SENT_MSG", &contact.name, text, 0);
+        log_sent(app, value.clone(), "SENT_MSG", &contact.name, text, 0)?;
     }
     Ok(value)
 }
@@ -67,8 +90,9 @@ pub async fn send_msg(app: &App, to: &Recipient, text: &str) -> Result<Value, me
 /// # Errors
 ///
 /// A text the device cannot take (too long, empty or with a NUL
-/// character); nothing was sent.
-pub async fn msg_ack(app: &App, to: &Recipient, text: &str) -> Result<bool, meshcore::Error> {
+/// character), when nothing was sent, or a message log that cannot be
+/// written.
+pub async fn msg_ack(app: &App, to: &Recipient, text: &str) -> Result<bool, SendError> {
     let (max_attempts, flood_after, max_flood_attempts) = {
         let s = app.settings();
         (s.max_attempts, s.flood_after, s.max_flood_attempts)
@@ -77,10 +101,14 @@ pub async fn msg_ack(app: &App, to: &Recipient, text: &str) -> Result<bool, mesh
         Recipient::Contact(contact) => app.timeout_for(&contact.public_key),
         Recipient::Key(_) => None,
     };
+    // the counts as meshcore_py's loop reads them: a negative count makes
+    // no attempt, a negative flood_after (like one beyond the attempts) is
+    // never reached
+    let count = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
     let options = RetryOptions {
-        max_attempts,
-        flood_after,
-        max_flood_attempts,
+        max_attempts: count(max_attempts),
+        flood_after: u32::try_from(flood_after).unwrap_or(u32::MAX),
+        max_flood_attempts: count(max_flood_attempts),
         timeout,
         ..RetryOptions::default()
     };
@@ -91,12 +119,12 @@ pub async fn msg_ack(app: &App, to: &Recipient, text: &str) -> Result<bool, mesh
     {
         Ok(Some(sent)) => {
             if let Recipient::Contact(contact) = to {
-                log_sent(app, to_value(&sent), "SENT_MSG", &contact.name, text, 0);
+                log_sent(app, to_value(&sent), "SENT_MSG", &contact.name, text, 0)?;
             }
             Ok(true)
         }
         Ok(None) => Ok(false),
-        Err(e @ meshcore::Error::InvalidArgument(_)) => Err(e),
+        Err(e @ meshcore::Error::InvalidArgument(_)) => Err(SendError::Send(e)),
         Err(e) => {
             log::debug!("send_msg_with_retry: {e}");
             Ok(false)
@@ -105,11 +133,7 @@ pub async fn msg_ack(app: &App, to: &Recipient, text: &str) -> Result<bool, mesh
 }
 
 /// Sends a command to a node (`send_cmd`); logs it on success.
-pub async fn send_cmd_logged(
-    app: &App,
-    contact: &Contact,
-    cmd: &str,
-) -> Result<Value, meshcore::Error> {
+pub async fn send_cmd_logged(app: &App, contact: &Contact, cmd: &str) -> Result<Value, SendError> {
     let sent = app
         .mc
         .send_cmd(
@@ -120,19 +144,19 @@ pub async fn send_cmd_logged(
         )
         .await?;
     let value = to_value(&sent);
-    log_sent(app, value.clone(), "SENT_CMD", &contact.name, cmd, 1);
+    log_sent(app, value.clone(), "SENT_CMD", &contact.name, cmd, 1)?;
     Ok(value)
 }
 
 /// Sends a channel message (`send_chan_msg`); logs it on success.
-pub async fn send_chan_msg(app: &App, index: u8, text: &str) -> Result<Value, meshcore::Error> {
+pub async fn send_chan_msg(app: &App, index: u8, text: &str) -> Result<Value, SendError> {
     app.mc.send_chan_msg(index, text, None).await?;
     let chan_name = app
         .cached_channel_name(index)
         .unwrap_or_else(|| format!("channel {index}"));
     // key order of the reference: type first, then the channel
     let sent = json!({"type": "SENT_CHAN", "channel_idx": index, "chan_name": chan_name});
-    log_sent(app, sent, "SENT_CHAN", &chan_name, text, 0);
+    log_sent(app, sent, "SENT_CHAN", &chan_name, text, 0)?;
     Ok(json!({}))
 }
 
@@ -207,11 +231,13 @@ pub async fn msg(c: &mut Ctx<'_>) -> CmdResult {
         match msg_ack(c.app, &recipient, &text).await {
             Ok(true) => {}
             Ok(false) => c.error(&json!({"ack": false}), "No ack received"),
-            Err(e) => c.line(&format!("Error sending message: {e}")),
+            Err(SendError::Send(e)) => c.line(&format!("Error sending message: {e}")),
+            Err(SendError::Log(e)) => return Err(CmdError::Failed(e)),
         }
     } else {
         match send_msg(c.app, &recipient, &text).await {
-            Err(e) => c.line(&format!("Error sending message: {e}")),
+            Err(SendError::Send(e)) => c.line(&format!("Error sending message: {e}")),
+            Err(SendError::Log(e)) => return Err(CmdError::Failed(e)),
             Ok(sent) => {
                 if c.json {
                     c.json_indent(&sent);
@@ -242,7 +268,8 @@ pub async fn chan(c: &mut Ctx<'_>) -> CmdResult {
         None => super::channels::slot_number(&chan)?,
     };
     match send_chan_msg(c.app, index, &text).await {
-        Err(e) => c.line(&format!("Error sending message: {e}")),
+        Err(SendError::Send(e)) => c.line(&format!("Error sending message: {e}")),
+        Err(SendError::Log(e)) => return Err(CmdError::Failed(e)),
         Ok(payload) => {
             if c.json {
                 c.json_indent(&payload);
@@ -256,7 +283,8 @@ pub async fn chan(c: &mut Ctx<'_>) -> CmdResult {
 pub async fn public(c: &mut Ctx<'_>) -> CmdResult {
     let text = c.arg(1)?.to_string();
     match send_chan_msg(c.app, 0, &text).await {
-        Err(e) => c.line(&format!("Error sending message: {e}")),
+        Err(SendError::Send(e)) => c.line(&format!("Error sending message: {e}")),
+        Err(SendError::Log(e)) => return Err(CmdError::Failed(e)),
         Ok(payload) => {
             if c.json {
                 c.json_indent(&payload);
@@ -368,7 +396,8 @@ pub async fn cmd(c: &mut Ctx<'_>) -> CmdResult {
             // read once the contact is known, as in the reference
             let command = c.arg(2)?.to_string();
             match send_cmd_logged(c.app, &contact, &command).await {
-                Err(e) => c.line(&format!("Error sending cmd: {e}")),
+                Err(SendError::Send(e)) => c.line(&format!("Error sending cmd: {e}")),
+                Err(SendError::Log(e)) => return Err(CmdError::Failed(e)),
                 Ok(sent) => {
                     if c.json {
                         c.json_indent(&sent);

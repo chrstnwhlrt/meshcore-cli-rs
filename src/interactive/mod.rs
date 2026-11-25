@@ -19,7 +19,9 @@ use rustyline::error::ReadlineError;
 pub use chat::{FilterError, apply_command_to_contacts, process_contact_chat_line};
 
 use crate::app::{App, Target, contact_type, to_value, vint, vstr};
-use crate::commands::{Recipient, msg_ack, process_cmds, send_chan_msg, subscribe_to_msgs};
+use crate::commands::{
+    Recipient, SendError, msg_ack, process_cmds, send_chan_msg, subscribe_to_msgs,
+};
 use crate::editor::{Completion, LineEditor, StyledPrompt};
 use crate::output::{self, Sink};
 use crate::paths;
@@ -27,7 +29,7 @@ use crate::util::ansi;
 use crate::util::py;
 use crate::util::shlex;
 use crate::util::text::{
-    FormatErrorKind, SafeFormatter, has_placeholder, split_pipeline, strip_outer_quotes,
+    FormatErrorKind, SafeFormatter, has_placeholder, send_text, split_pipeline, strip_outer_quotes,
 };
 
 /// Where the chat currently is, and where it was before (`to ..`).
@@ -216,10 +218,16 @@ async fn fetch_contacts_animated(app: &App) {
         return;
     }
     let mut received = 0usize;
+    // the reference waits in windows of 5 s and gives up after one without
+    // a contact; other events do not count
+    let window = std::time::Duration::from_secs(5);
+    let mut window_end = tokio::time::Instant::now() + window;
+    let mut activity = false;
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv()).await {
+        match tokio::time::timeout_at(window_end, subscription.recv()).await {
             Ok(Some(meshcore::Event::NextContact(_))) => {
                 received += 1;
+                activity = true;
                 output::print(".");
             }
             Ok(Some(meshcore::Event::Contacts(list))) => {
@@ -238,6 +246,10 @@ async fn fetch_contacts_animated(app: &App) {
                 return;
             }
             Ok(Some(_)) => {}
+            Err(_) if activity => {
+                activity = false;
+                window_end += window;
+            }
             Ok(None) | Err(_) => {
                 // like the reference, without ending the line
                 log::debug!("Timeout while getting contacts");
@@ -246,6 +258,11 @@ async fn fetch_contacts_animated(app: &App) {
         }
     }
 }
+
+/// True while the chat loop runs, from where the reference's `try` starts:
+/// a Ctrl-C that cancels a command there ends the chat with "Exiting cli"
+/// instead of the program's "Exited cleanly".
+pub static IN_LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Runs the chat mode (`interactive_loop`).
 pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
@@ -257,7 +274,7 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
     );
 
     let mut nav = Nav::default();
-    nav.scope = app.set_scope("").await;
+    nav.scope = app.set_scope(Some("")).await;
     nav.prev_scope = nav.scope.clone();
 
     fetch_contacts_animated(app).await;
@@ -273,6 +290,7 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
     )
     .await;
     subscribe_to_msgs(app, json_output).await;
+    IN_LOOP.store(true, std::sync::atomic::Ordering::Relaxed);
 
     if let Ok(vars) = app.mc.get_custom_vars().await
         && let serde_json::Value::Object(map) = to_value(&vars)
@@ -285,6 +303,7 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
         Ok(editor) => editor,
         Err(e) => {
             log::error!("Cannot start line editor: {e}");
+            IN_LOOP.store(false, std::sync::atomic::Ordering::Relaxed);
             return;
         }
     };
@@ -293,9 +312,8 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
 
     let mut last_ack = true;
     loop {
-        if let Some(scope) = nav.scope.clone() {
-            nav.scope = app.set_scope(&scope).await;
-        }
+        // also without a scope, which resets one a failed change left
+        nav.scope = app.set_scope(nav.scope.as_deref()).await;
 
         let prompt = build_prompt(app, &nav, last_ack);
         let tree = completion::make_completion_dict(app, nav.contact.as_ref());
@@ -383,6 +401,7 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
             break;
         }
     }
+    IN_LOOP.store(false, std::sync::atomic::Ordering::Relaxed);
     output::set_external_printer(None);
 }
 
@@ -508,6 +527,11 @@ pub async fn process_redirected_line(
                 return unchanged();
             }
         };
+        // Python looks an empty program name up in the PATH directories
+        if argv[0].is_empty() {
+            report_spawn_error(&crate::handlers::empty_program_error(), &pcom, &argv[0]);
+            return unchanged();
+        }
         let stdout = match sink.take_stdio() {
             Ok(stdout) => stdout,
             Err(e) => {
@@ -590,6 +614,10 @@ pub async fn process_redirected_line(
                 return unchanged();
             }
         };
+        if argv[0].is_empty() {
+            report_spawn_error(&crate::handlers::empty_program_error(), &pcom, &argv[0]);
+            return unchanged();
+        }
         // subprocess.run(..., capture_output=True, text=True): stdin stays
         // the terminal's
         let output = match tokio::process::Command::new(&argv[0])
@@ -777,7 +805,7 @@ async fn goto(app: &Arc<App>, dest: &str, nav: &mut Nav, sink: &mut Sink) -> Res
     let dest_scope = dest_scope.or_else(|| nav.scope.clone());
     if nav.scope.is_some() && dest_scope != nav.scope {
         let new_scope = match &dest_scope {
-            Some(scope) => app.set_scope(scope).await,
+            Some(scope) => app.set_scope(Some(scope)).await,
             None => None,
         };
         nav.set_scope(new_scope);
@@ -823,7 +851,7 @@ pub async fn process_line(
     if line.starts_with("/scope") || (line.starts_with("scope") && nav.contact.is_none()) {
         if nav.scope.is_some() {
             if let Some((_, new_scope)) = line.split_once(' ') {
-                let scope = app.set_scope(new_scope).await;
+                let scope = app.set_scope(Some(new_scope)).await;
                 nav.set_scope(scope);
             } else {
                 sink.write(nav.scope.as_deref().unwrap_or_default());
@@ -873,11 +901,11 @@ pub async fn process_line(
         match last {
             None => sink.write("No received msg yet !\n"),
             Some(Target::Channel { index, .. }) => {
-                chat_chan_msg(app, channel_slot(index)?, text, sink, end).await;
+                chat_chan_msg(app, channel_slot(index)?, text, sink, end).await?;
             }
             Some(Target::Contact(contact)) => {
                 last_ack =
-                    chat_msg(app, &Recipient::Contact(contact.clone()), text, sink, end).await;
+                    chat_msg(app, &Recipient::Contact(contact.clone()), text, sink, end).await?;
                 if !last_ack {
                     nav.set_contact(Some(Target::Contact(contact)));
                 }
@@ -920,19 +948,24 @@ pub async fn process_line(
 
 /// Sends a message from the chat and waits for its ack. A text the device
 /// cannot take is reported; the reference sends it and fails silently.
+///
+/// # Errors
+///
+/// A message log that cannot be written, which the reference raises.
 pub(crate) async fn chat_msg(
     app: &App,
     to: &Recipient,
     text: &str,
     sink: &mut Sink,
     end: &str,
-) -> bool {
+) -> Result<bool, Raised> {
     match msg_ack(app, to, text).await {
-        Ok(acked) => acked,
-        Err(e) => {
+        Ok(acked) => Ok(acked),
+        Err(SendError::Send(e)) => {
             sink.write(&format!("Error sending message: {e}{end}"));
-            false
+            Ok(false)
         }
+        Err(SendError::Log(e)) => Err(Raised::Other(e)),
     }
 }
 
@@ -951,9 +984,24 @@ fn channel_slot(index: i64) -> Result<u8, Raised> {
 /// Sends a channel message from the chat. As in the reference, failures go
 /// unreported, except a text the device cannot take, which the reference
 /// would send cut short.
-async fn chat_chan_msg(app: &App, index: u8, text: &str, sink: &mut Sink, end: &str) {
-    if let Err(e @ meshcore::Error::InvalidArgument(_)) = send_chan_msg(app, index, text).await {
-        sink.write(&format!("Error sending message: {e}{end}"));
+///
+/// # Errors
+///
+/// A message log that cannot be written, which the reference raises.
+async fn chat_chan_msg(
+    app: &App,
+    index: u8,
+    text: &str,
+    sink: &mut Sink,
+    end: &str,
+) -> Result<(), Raised> {
+    match send_chan_msg(app, index, text).await {
+        Err(SendError::Send(e @ meshcore::Error::InvalidArgument(_))) => {
+            sink.write(&format!("Error sending message: {e}{end}"));
+            Ok(())
+        }
+        Err(SendError::Log(e)) => Err(Raised::Other(e)),
+        Ok(_) | Err(SendError::Send(_)) => Ok(()),
     }
 }
 
@@ -976,11 +1024,8 @@ async fn chat_line(
         sink.write(&format!("{}\n", names.join(", ")));
         return Ok(true);
     }
-    let (explicit, text) = if let Some(rest) = line.strip_prefix("send") {
-        (
-            true,
-            strip_outer_quotes(py::strip(rest.get(1..).unwrap_or_default())).to_string(),
-        )
+    let (explicit, text) = if let Some(text) = send_text(line) {
+        (true, strip_outer_quotes(text).to_string())
     } else if line.starts_with('"') {
         (true, strip_outer_quotes(line).to_string())
     } else {
@@ -994,7 +1039,7 @@ async fn chat_line(
             } else {
                 &text
             };
-            chat_chan_msg(app, channel_slot(*index)?, text, sink, end).await;
+            chat_chan_msg(app, channel_slot(*index)?, text, sink, end).await?;
             Ok(true)
         }
         Target::Contact(contact) => match contact_type(contact) {
@@ -1002,7 +1047,7 @@ async fn chat_line(
             // fails on its missing channel number
             0 => Err(Raised::Key("'chan_nb'".to_string())),
             kind if explicit || kind == 1 => {
-                Ok(chat_msg(app, &Recipient::Contact(contact.clone()), &text, sink, end).await)
+                chat_msg(app, &Recipient::Contact(contact.clone()), &text, sink, end).await
             }
             2..=4 => {
                 let args = vec!["cmd".to_string(), contact.name.clone(), line.to_string()];
@@ -1025,10 +1070,9 @@ async fn process_slash_cmd(
     end: &str,
 ) -> Result<bool, Raised> {
     let path = line.split(' ').next().unwrap_or_default();
+    // back to the scope of the line, also to none (see App::set_scope)
     let restore = |app: Arc<App>, scope: Option<String>| async move {
-        if let Some(scope) = scope {
-            app.set_scope(&scope).await;
-        }
+        app.set_scope(scope.as_deref()).await;
     };
     let mut result = true;
 
@@ -1036,19 +1080,19 @@ async fn process_slash_cmd(
         let args: Vec<&str> = line[1..].split(' ').collect();
         let (dest, dest_scope) = split_scope(args[0]);
         if let Some(dest_scope) = dest_scope {
-            app.set_scope(&dest_scope).await;
+            app.set_scope(Some(&dest_scope)).await;
         }
         let rest = line.split_once(' ').map(|(_, r)| r.to_string());
         let contact = app.contact_from_arg(&dest).await;
         if let (Some(text), Some(contact)) = (&rest, contact) {
             if matches!(contact_type(&contact), 1 | 3) {
                 // the reference drops the ack here, the prompt stays as it is
-                chat_msg(app, &Recipient::Contact(Box::new(contact)), text, sink, end).await;
+                chat_msg(app, &Recipient::Contact(Box::new(contact)), text, sink, end).await?;
             } else {
                 sink.write("Can only send msg to chan, client or room\n");
             }
         } else if let (Some(text), Some(channel)) = (&rest, app.channel_by_name(&dest).await) {
-            chat_chan_msg(app, channel.index, text, sink, end).await;
+            chat_chan_msg(app, channel.index, text, sink, end).await?;
         } else if let Ok(cmds) = shlex::split(&line[1..]) {
             process_cmds(app, &cmds, json, sink, "\n").await;
         } else {
@@ -1061,7 +1105,7 @@ async fn process_slash_cmd(
             .unwrap_or_default();
         let (name, dest_scope) = split_scope(path[1..].split('/').next().unwrap_or_default());
         if let Some(dest_scope) = dest_scope {
-            app.set_scope(&dest_scope).await;
+            app.set_scope(Some(&dest_scope)).await;
         }
         match app.contact_from_arg(&name).await {
             None => sink.write(&format!("{name} is not a contact\n")),
@@ -1080,7 +1124,7 @@ async fn process_slash_cmd(
                             sink,
                             end,
                         )
-                        .await;
+                        .await?;
                     } else {
                         let args = vec!["cmd".to_string(), contact.name.clone(), cmdline];
                         process_cmds(app, &args, json, sink, "\n").await;

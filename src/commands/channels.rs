@@ -191,7 +191,7 @@ pub async fn remove_channel(c: &mut Ctx<'_>) -> CmdResult {
 /// `scope <scope>`: sets the flood scope.
 pub async fn scope(c: &mut Ctx<'_>) -> CmdResult {
     let scope = c.arg(1)?.to_string();
-    if c.app.set_scope(&scope).await.is_none() {
+    if c.app.set_scope(Some(&scope)).await.is_none() {
         c.line("Error while setting scope");
     }
     Ok(1)

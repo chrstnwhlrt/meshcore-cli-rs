@@ -190,17 +190,26 @@ fn channel_prefix(app: &App, data: &Value, path_str: &str) -> String {
     format!("{}{name} {path_str}", ansi::GREEN)
 }
 
-/// Handles an incoming message event (`handle_message`).
-async fn handle_message(app: &App, payload: Value) {
-    let _ = app.mc.ensure_contacts(false).await;
+/// Handles an incoming message event (`handle_message`); `event_type` is
+/// the name of its `EventType` in the reference.
+async fn handle_message(app: &App, payload: Value, event_type: &str) {
     let json_output = app.settings().json_msgs;
+    // sender names come from the contact list, which json leaves out
+    if !json_output {
+        let _ = app.mc.ensure_contacts(false).await;
+    }
     output::print(&format_message(app, &payload, json_output, "\n"));
+    // the message is logged before the handlers get it; a log that cannot
+    // be written ends the reference's event handler there
+    if let Err(e) = app.log_message(payload.clone()) {
+        log::error!("Error in event handler for EventType.{event_type}: {e}");
+        return;
+    }
     if vstr(&payload, "type") == "DATA" {
         app.handlers.enqueue("chan_data", &payload);
     } else {
         app.handlers.enqueue("msgs", &payload);
     }
-    app.log_message(payload);
 }
 
 /// Handles a received packet log (`handle_log_rx`).
@@ -394,7 +403,12 @@ pub fn spawn_event_task(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 Event::ContactMessage(_) | Event::ChannelMessage(_) | Event::ChannelData(_)
                     if app.msgs_subscribed.load(Ordering::Relaxed) =>
                 {
-                    handle_message(&app, to_value(&event)).await;
+                    let event_type = match &event {
+                        Event::ContactMessage(_) => "CONTACT_MSG_RECV",
+                        Event::ChannelMessage(_) => "CHANNEL_MSG_RECV",
+                        _ => "CHANNEL_DATA_RECV",
+                    };
+                    handle_message(&app, to_value(&event), event_type).await;
                     app.messages_shown.send_modify(|n| *n = n.wrapping_add(1));
                 }
                 _ => {}

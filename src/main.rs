@@ -57,7 +57,12 @@ async fn run_until_done(argv: Vec<String>) -> ExitCode {
     let code = tokio::select! {
         code = run(argv, &connection) => code,
         _ = tokio::signal::ctrl_c() => {
-            println!("\nExited cleanly");
+            if interactive::IN_LOOP.load(Ordering::Relaxed) {
+                // the chat loop catches the cancellation in the reference
+                output::print("Exiting cli\n");
+            } else {
+                println!("\nExited cleanly");
+            }
             interrupted = true;
             ExitCode::SUCCESS
         }

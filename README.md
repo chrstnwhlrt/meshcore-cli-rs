@@ -187,6 +187,7 @@ Fixed in this port, where the reference fails or prints wrong data:
 - `change_path` reports a hash mode below 0 (a first hash of one digit gives -1) or above 3 as an error; the reference fails there with a Python error.
 - `reset_advert_time` with an unknown contact says so; the reference fails with a Python error.
 - `get custom` and `get <variable>` with `-j` print a failed request as `{"error": ...}`; the reference fails with a Python error.
+- `get private_key` on a device that does not export its key says so; the reference fails with a Python error.
 - `set tx` takes values up to 127. The reference sends larger ones too, and the device reads only their lowest byte, so 276 sets 20 dBm.
 - `set radio` rounds the frequency to whole kHz and the bandwidth to whole Hz. The reference cuts off the rest after a float multiplication, so it sets 869.462 MHz for 869.4625 and 512.001 MHz for 512.002.
 - `add_contact` with a key that is not 32 bytes long reports the command format. The reference sends it, and the device reads the fields after the key into it.
@@ -195,7 +196,8 @@ Fixed in this port, where the reference fails or prints wrong data:
 - An `@alias` line with an unclosed quote is reported; the reference ends chat mode with a traceback.
 - A line of the `scopes` file that is not `<channel> <scope>` is reported as an error. The reference means to do that too, but its message is lost because logging is set up only after the file is read.
 - A `scopes` file, repeater mode script or region file that cannot be read or is not UTF-8 is reported as an error. The reference fails with a Python error, for `scopes` at every start and for a region file that is not UTF-8 after it sent part of it.
-- Typos and invisible non-breaking spaces in help texts and output are fixed, and the help lists all commands and parameters. It no longer offers `e` as short form of `card`, which the reference lists but does not know.
+- A history file or `default_address` that cannot be read or written is left aside. With such a `default_address` the reference fails with a Python error at every start or after a BLE connection, and with such a history file prompt_toolkit shows errors instead of reading lines.
+- Typos and invisible non-breaking spaces in help texts and output are fixed, `?trace` gives 2 as the flag value of 4 byte hashes (the reference says 3), and the help lists all commands and parameters. It no longer offers `e` as short form of `card`, which the reference lists but does not know.
 
 Behaves differently on purpose:
 
@@ -208,6 +210,7 @@ Behaves differently on purpose:
 - `-l` prints "No ble device found" when no MeshCore device is in range. The reference prints it only when it sees no Bluetooth device at all.
 - A BLE device that another program on this computer is using is reported as in use after about 3 s. The reference tries to connect for 30 s, then scans for the device and reports that it cannot find it, since a connected device does not advertise.
 - Device errors read like `device error 6 (ERR_CODE_ILLEGAL_ARG)` instead of a Python object, and `handlers` leaves out internal Python objects.
+- When `upload_card` or `upload_contact` cannot reach the map, the error message is the one of the HTTP library ureq instead of the one of Python's requests.
 - Input the device cannot take whole is refused with the reason before anything is sent, also in chat mode: a text over 160 bytes (on a channel including the node name and ": "), a command over 176 bytes, a login password over 15 bytes, an empty message, node name or CLI command, a NUL character in a text or name, a `:` in the name of a custom variable, a private key that is not 64 bytes long, a contact card under 98 bytes, a raw packet under 2 bytes, a trace without hops, a path that is not a whole number of hops, a path over 63 hops or 64 bytes, a path hash mode above 2 (mode 3 is reserved) and coordinates beyond 90 degrees latitude or 180 degrees longitude. The reference sends it, and the device rejects it (a too long direct message with ERR_CODE_TABLE_FULL, coordinates with ERR_CODE_ILLEGAL_ARG, the short or empty ones as an unknown command), cuts it short or reads it differently. Apart from the private key, meshcore-rs makes these checks, and its README lists them. They assume companion firmware 1.16 or newer; older firmware takes frames of 172 instead of 176 bytes, so there a direct message or a command to a node holds at most 159 bytes.
 - Further details follow meshcore-rs, whose README lists where it differs from meshcore_py: for example `reload_contacts` forgets contacts removed on the device, and names longer than the 31 bytes the device keeps are cut at a character boundary.
 - The JSON of `req_neighbours` has no empty line after it.

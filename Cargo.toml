@@ -27,7 +27,7 @@ ble = ["meshcore/ble"]
 meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs", features = ["serde"] }
 
 # Async runtime, child processes for handlers and pipes (their output read
-# through a pipe), Ctrl-C
+# through a pipe), Ctrl-C, the name lookup for TCP connections
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util", "net"] }
 
 # Line editing, history and completion
@@ -61,7 +61,7 @@ terminal_size = "0.4.4"
 
 [target.'cfg(unix)'.dependencies]
 # Open flags and error numbers, to report a serial port that cannot be
-# opened the way pyserial does in repeater mode
+# opened the way pyserial does
 libc = "0.2.191"
 
 [lints.rust]

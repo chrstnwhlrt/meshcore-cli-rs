@@ -24,7 +24,7 @@ use crate::output::Sink;
 use crate::util::json::{dumps, dumps_indent};
 
 pub use contacts::contact_path_str;
-pub use messaging::{Recipient, msg_ack, send_chan_msg, subscribe_to_msgs};
+pub use messaging::{Recipient, SendError, msg_ack, send_chan_msg, subscribe_to_msgs};
 pub use misc::seconds;
 pub use remote::{print_disc_trace_to, print_trace_to};
 
@@ -61,6 +61,14 @@ pub fn py_error_payload(error: &meshcore::Error) -> Option<Value> {
             Some(Value::Object(map))
         }
         meshcore::Error::Timeout => Some(serde_json::json!({"reason": "no_event_received"})),
+        // a reply that could not be read, with meshcore-rs's reason, which
+        // is meshcore_py's (`invalid_frame_length`, `unknown_stats_type: N`);
+        // an error reply without a code has an empty payload there
+        meshcore::Error::Protocol(reason) => Some(if reason == "error reply without a code" {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "reason": reason })
+        }),
         _ => None,
     }
 }

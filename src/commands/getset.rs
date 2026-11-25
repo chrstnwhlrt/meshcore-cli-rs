@@ -130,11 +130,9 @@ fn micro_degrees(value: f64) -> Result<f64, CmdError> {
     }
 }
 
-/// A retry count: `int(value)`; the reference also takes negative counts,
-/// which mean no attempt at all.
-fn retry_count(value: &str) -> Result<u32, CmdError> {
-    let number = crate::util::py::int(value, 10).map_err(CmdError::Failed)?;
-    Ok(u32::try_from(number.max(0)).unwrap_or(u32::MAX))
+/// A retry count: `int(value)`, kept as it is, negative too (see `msg_ack`).
+fn retry_count(value: &str) -> Result<i64, CmdError> {
+    crate::util::py::int(value, 10).map_err(CmdError::Failed)
 }
 
 /// Echo of a display setting in json mode.
@@ -641,17 +639,14 @@ pub async fn get(c: &mut Ctx<'_>) -> CmdResult {
         "stats_packets" => stats(c, app.mc.get_stats_packets().await.map(|s| to_value(&s))),
         "stats" | "status" => {
             let mut merged = serde_json::Map::new();
-            for (label, result) in [
-                ("core", app.mc.get_stats_core().await.map(|s| to_value(&s))),
-                (
-                    "radio",
-                    app.mc.get_stats_radio().await.map(|s| to_value(&s)),
-                ),
-                (
-                    "packets",
-                    app.mc.get_stats_packets().await.map(|s| to_value(&s)),
-                ),
-            ] {
+            // each answer is checked before the next request, so that the
+            // log lines come in the order of the reference
+            for label in ["core", "radio", "packets"] {
+                let result = match label {
+                    "core" => app.mc.get_stats_core().await.map(|s| to_value(&s)),
+                    "radio" => app.mc.get_stats_radio().await.map(|s| to_value(&s)),
+                    _ => app.mc.get_stats_packets().await.map(|s| to_value(&s)),
+                };
                 match result {
                     Ok(Value::Object(map)) => merged.extend(map),
                     Ok(_) => {}
