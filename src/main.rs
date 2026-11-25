@@ -56,10 +56,22 @@ fn main() -> ExitCode {
     code
 }
 
+/// Ends the program after a signal it does not see, as while it waits for a
+/// terminal or a pipe to take its output.
+async fn end_blocked(session: Arc<OnceLock<Arc<App>>>) {
+    let number = signals::terminated().await;
+    tokio::time::sleep(2 * CLOSE_WAIT).await;
+    if let Some(app) = session.get() {
+        let _ = tokio::time::timeout(CLOSE_WAIT, app.mc.disconnect()).await;
+    }
+    std::process::exit(128 + i32::from(number));
+}
+
 /// Runs the program until it is done or a signal ends it, then closes the
 /// connection.
 async fn run_until_done(argv: Vec<String>) -> ExitCode {
-    let session: OnceLock<Arc<App>> = OnceLock::new();
+    let session: Arc<OnceLock<Arc<App>>> = Arc::default();
+    tokio::spawn(end_blocked(Arc::clone(&session)));
     let mut signal = None;
     let code = tokio::select! {
         // a signal that came while the program did not wait counts first
@@ -230,8 +242,8 @@ async fn parse_options(argv: &[String]) -> Result<Options, ExitCode> {
 ///
 /// # Errors
 ///
-/// A script that cannot be read ends the program, as the exception does in
-/// the reference.
+/// A script that cannot be read, or whose output cannot be written, ends the
+/// program, as the exception does in the reference.
 async fn run_init_script(
     app: &Arc<App>,
     path: &std::path::Path,
@@ -242,6 +254,9 @@ async fn run_init_script(
         .await
         .map_err(|e| python_error(&e))?;
     output::print(&output);
+    if output::stdout_error().is_some() {
+        return Err(ExitCode::FAILURE);
+    }
     Ok(())
 }
 
@@ -352,7 +367,7 @@ async fn run(argv: Vec<String>, session: &OnceLock<Arc<App>>) -> ExitCode {
         }
     }
 
-    if o.commands.is_empty() || force_interactive {
+    if (o.commands.is_empty() || force_interactive) && output::stdout_error().is_none() {
         interactive::interactive_loop(&app, o.json).await;
     }
     ExitCode::SUCCESS

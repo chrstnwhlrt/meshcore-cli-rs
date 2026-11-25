@@ -3,46 +3,58 @@
 /// Number of the signal Ctrl-C sends.
 pub const INTERRUPT: u8 = 2;
 
-/// Waits for a signal that ends the program and returns its number: Ctrl-C,
-/// or on Unix also SIGTERM (`kill`, `timeout`, a service that is stopped) or
-/// SIGHUP (the terminal is gone). Without a handler the last two would end
-/// the program before it closes its connection.
-#[cfg(unix)]
+/// Waits for a signal that ends the program and returns its number: Ctrl-C
+/// or one of [`terminated`].
 pub async fn ending() -> u8 {
-    use tokio::signal::unix::{Signal, SignalKind, signal};
-
-    async fn received(signal: &mut Option<Signal>) {
-        match signal {
-            Some(signal) => {
-                signal.recv().await;
-            }
-            None => std::future::pending().await,
-        }
-    }
-
-    let ignored = ignored();
-    let listen = |kind: SignalKind| {
-        (ignored >> (kind.as_raw_value() - 1) & 1 == 0)
-            .then(|| signal(kind).ok())
-            .flatten()
-    };
-    let mut interrupt = listen(SignalKind::interrupt());
-    let mut terminate = listen(SignalKind::terminate());
-    let mut hangup = listen(SignalKind::hangup());
     tokio::select! {
-        () = received(&mut interrupt) => INTERRUPT,
-        () = received(&mut terminate) => 15,
-        () = received(&mut hangup) => 1,
+        () = interrupted() => INTERRUPT,
+        number = terminated() => number,
     }
 }
 
-/// Waits for Ctrl-C and returns its number.
+/// Waits for Ctrl-C.
+#[cfg(unix)]
+async fn interrupted() {
+    received(tokio::signal::unix::SignalKind::interrupt()).await;
+}
+
+/// Waits for Ctrl-C.
 #[cfg(not(unix))]
-pub async fn ending() -> u8 {
+async fn interrupted() {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
     }
-    INTERRUPT
+}
+
+/// Waits for SIGTERM (`kill`, `timeout`, a service that is stopped) or SIGHUP
+/// (the terminal is gone) and returns its number. Without a handler they
+/// would end the program before it closes its connection.
+#[cfg(unix)]
+pub async fn terminated() -> u8 {
+    use tokio::signal::unix::SignalKind;
+
+    tokio::select! {
+        () = received(SignalKind::terminate()) => 15,
+        () = received(SignalKind::hangup()) => 1,
+    }
+}
+
+/// There are no such signals here.
+#[cfg(not(unix))]
+pub async fn terminated() -> u8 {
+    std::future::pending().await
+}
+
+/// Waits for a signal; for ever when the program was started to ignore it.
+#[cfg(unix)]
+async fn received(kind: tokio::signal::unix::SignalKind) {
+    if ignored() >> (kind.as_raw_value() - 1) & 1 == 0
+        && let Ok(mut signal) = tokio::signal::unix::signal(kind)
+    {
+        signal.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// The signals the program was started to ignore, signal 1 in the lowest
@@ -52,10 +64,13 @@ pub async fn ending() -> u8 {
 /// ignored.
 #[cfg(unix)]
 fn ignored() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| ignored_mask(&status))
-        .unwrap_or(0)
+    static IGNORED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *IGNORED.get_or_init(|| {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| ignored_mask(&status))
+            .unwrap_or(0)
+    })
 }
 
 /// The mask of ignored signals in `/proc/self/status`.

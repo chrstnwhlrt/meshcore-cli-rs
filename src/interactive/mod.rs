@@ -287,6 +287,10 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
 
     fetch_contacts_animated(app).await;
     app.channels(true).await;
+    // the messages waiting stay on the device when nothing can be shown
+    if output::stdout_error().is_some() {
+        return;
+    }
 
     let mut stdout = Sink::Stdout;
     process_cmds(
