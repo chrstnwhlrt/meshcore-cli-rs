@@ -26,12 +26,13 @@ ble = ["meshcore/ble"]
 # MeshCore protocol library, at the release this CLI is tested with
 meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs", tag = "v0.10.12", features = ["serde"] }
 
-# Async runtime, child processes for handlers and pipes (their output read
-# through a pipe), Ctrl-C, the name lookup for TCP connections
+# Async runtime, child processes of handlers (their output read through a
+# pipe), signals, the name lookup for TCP connections
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util", "net"] }
 
-# Line editing, history and completion
-rustyline = { version = "19.0.0", default-features = false, features = ["with-dirs"] }
+# Line editing, history and completion; buffer-redux keeps the lines after
+# the first of several pasted at once
+rustyline = { version = "19.0.0", default-features = false, features = ["with-dirs", "buffer-redux"] }
 
 # Display width of a typed password for its masking stars (as rustyline
 # measures it)
@@ -70,6 +71,10 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# println! and its kin panic when nobody reads the output any more; the
+# output module writes instead
+print_stderr = "deny"
+print_stdout = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

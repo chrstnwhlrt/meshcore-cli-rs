@@ -21,11 +21,10 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::{
-    ColorMode, CompletionType, Config, Context, Editor, ExternalPrinter, Helper, Prompt,
-};
+use rustyline::{ColorMode, CompletionType, Config, Context, Editor, Helper, Prompt};
 
 use crate::history::FileHistory;
+use crate::output;
 use crate::util::text::escape_ansi;
 
 /// A prompt with a plain and a colored variant of the same width.
@@ -320,6 +319,8 @@ pub fn read_line(prompt: &str) -> Result<String, ReadlineError> {
 pub struct LineEditor {
     editor: Editor<CliHelper, DefaultHistory>,
     history: Option<FileHistory>,
+    /// Texts of other tasks are printed above the prompt.
+    prints_above: bool,
 }
 
 impl LineEditor {
@@ -347,7 +348,11 @@ impl LineEditor {
             file
         });
 
-        Ok(Self { editor, history })
+        Ok(Self {
+            editor,
+            history,
+            prints_above: false,
+        })
     }
 
     /// Sets the completion used for the next lines.
@@ -357,13 +362,22 @@ impl LineEditor {
         }
     }
 
-    /// Reads one line.
+    /// Reads one line. Bytes that are no UTF-8, from a file or a terminal
+    /// with another encoding, are reported and the prompt starts anew.
     ///
     /// # Errors
     ///
     /// Returns `Interrupted` on Ctrl-C and `Eof` on Ctrl-D.
     pub fn readline(&mut self, prompt: &StyledPrompt) -> Result<String, ReadlineError> {
-        self.editor.readline(prompt)
+        let _shown = self.prints_above.then(output::PromptShown::new);
+        loop {
+            match self.editor.readline(prompt) {
+                Err(ReadlineError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    log::error!("Unexpected error: {e}");
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Adds a line to the in-memory and the file history.
@@ -377,14 +391,13 @@ impl LineEditor {
         }
     }
 
-    /// Creates a printer that writes above the prompt while reading.
-    ///
-    /// Returns `None` when input or output is not a terminal.
-    pub fn external_printer(&mut self) -> Option<Box<dyn ExternalPrinter + Send>> {
-        self.editor
-            .create_external_printer()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn ExternalPrinter + Send>)
+    /// Prints the texts of other tasks above the prompt while reading,
+    /// unless input or output is no terminal.
+    pub fn print_above_prompt(&mut self) {
+        if let Ok(printer) = self.editor.create_external_printer() {
+            output::start_printer(Box::new(printer));
+            self.prints_above = true;
+        }
     }
 }
 

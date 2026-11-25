@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -325,6 +325,8 @@ pub struct App {
     /// chat), Python's `KeyboardInterrupt`: the command handler around it
     /// reports "Cancelled", or else the chat ends.
     pub interrupted: AtomicBool,
+    /// How many scripts are running, one inside the other.
+    pub script_depth: AtomicUsize,
 }
 
 impl App {
@@ -344,6 +346,7 @@ impl App {
             messages_shown: tokio::sync::watch::Sender::new(0),
             has_cli_cmd: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            script_depth: AtomicUsize::new(0),
         }
     }
 

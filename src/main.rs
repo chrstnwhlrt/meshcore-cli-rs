@@ -14,6 +14,7 @@ mod interactive;
 mod output;
 mod paths;
 mod repeater;
+mod signals;
 mod util;
 
 use std::process::ExitCode;
@@ -22,25 +23,31 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use log::LevelFilter;
-use meshcore::MeshCore;
 
 use crate::app::{App, Settings, to_value, vint, vstr};
 use crate::output::{Logger, Sink};
 
-/// How long the program waits for the connection to close when it ends.
-/// Over BLE, `BlueZ` confirms a disconnect only once the link is down, about
-/// 2 s later; the request is out long before and `BlueZ` completes it alone.
+/// How long the program waits for the connection to close and the handlers
+/// to finish when it ends. Over BLE, `BlueZ` confirms a disconnect only once
+/// the link is down, about 2 s later; the request is out long before and
+/// `BlueZ` completes it alone.
 const CLOSE_WAIT: Duration = Duration::from_millis(500);
 
 fn main() -> ExitCode {
     Logger::init();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv = Vec::new();
+    for arg in std::env::args_os().skip(1) {
+        match arg.into_string() {
+            Ok(arg) => argv.push(arg),
+            Err(arg) => {
+                let arg = arg.display();
+                return python_error(&format!("the argument '{arg}' is not UTF-8 text"));
+            }
+        }
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return python_error(&e.to_string()),
     };
     let code = runtime.block_on(run_until_done(argv));
     // a prompt still waiting for input after Ctrl-C must not keep the
@@ -49,34 +56,54 @@ fn main() -> ExitCode {
     code
 }
 
-/// Runs the program until it is done or interrupted with Ctrl-C, then
-/// closes the connection.
+/// Runs the program until it is done or a signal ends it, then closes the
+/// connection.
 async fn run_until_done(argv: Vec<String>) -> ExitCode {
-    let connection = OnceLock::new();
-    let mut interrupted = false;
+    let session: OnceLock<Arc<App>> = OnceLock::new();
+    let mut signal = None;
     let code = tokio::select! {
-        code = run(argv, &connection) => code,
-        _ = tokio::signal::ctrl_c() => {
-            if interactive::IN_LOOP.load(Ordering::Relaxed) {
-                // the chat loop catches the cancellation in the reference
-                output::print("Exiting cli\n");
-            } else {
-                println!("\nExited cleanly");
-            }
-            interrupted = true;
+        // a signal that came while the program did not wait counts first
+        biased;
+        number = signals::ending() => {
+            signal = Some(number);
             ExitCode::SUCCESS
         }
+        code = run(argv, &session) => code,
     };
+    if signal == Some(signals::INTERRUPT) {
+        // another signal ends the wait
+        tokio::select! {
+            () = interactive::processes_ended() => {}
+            _ = signals::ending() => {}
+        }
+        if interactive::IN_LOOP.load(Ordering::Relaxed) {
+            // the chat loop catches the cancellation in the reference
+            output::println("Exiting cli");
+        } else {
+            output::println("\nExited cleanly");
+        }
+    }
     // closed however the program ends: BlueZ keeps a BLE link up after the
     // program is gone, and the device does not advertise while connected
-    if let Some(mc) = connection.get() {
-        let _ = tokio::time::timeout(CLOSE_WAIT, mc.disconnect()).await;
-    } else if interrupted {
+    if let Some(app) = session.get() {
+        let close = async { tokio::join!(app.handlers.close(), app.mc.disconnect()) };
+        let _ = tokio::time::timeout(CLOSE_WAIT, close).await;
+    } else if signal.is_some() {
         // a BLE link still being set up is closed by the library in the
         // background, which needs the runtime for a moment
         tokio::time::sleep(CLOSE_WAIT).await;
     }
-    code
+    match (signal, output::stdout_error()) {
+        // what a shell reports for a program killed by the signal, as the
+        // reference is
+        (Some(number), _) if number != signals::INTERRUPT => ExitCode::from(128 + number),
+        // the reference ends with this error
+        (_, Some(error)) => {
+            output::eprintln(&format!("Error: {error}"));
+            ExitCode::FAILURE
+        }
+        _ => code,
+    }
 }
 
 /// Reads an option value with `int()`, like the reference; whether the
@@ -93,7 +120,7 @@ fn float_option(value: &str) -> Result<f64, ExitCode> {
 /// Ends the program like the reference after an exception: `Error:` and
 /// the message on stdout (the reference adds a traceback and exits with 0).
 fn python_error(message: &str) -> ExitCode {
-    println!("Error: {message}");
+    output::println(&format!("Error: {message}"));
     ExitCode::FAILURE
 }
 
@@ -116,8 +143,8 @@ struct Options {
 /// version, listing, errors).
 async fn parse_options(argv: &[String]) -> Result<Options, ExitCode> {
     let Ok((opts, commands)) = args::getopt(argv) else {
-        println!("Unrecognized option, use -h to get more help");
-        print!("{}", help::command_usage());
+        output::println("Unrecognized option, use -h to get more help");
+        output::print(&help::command_usage());
         return Err(ExitCode::FAILURE);
     };
     let mut o = Options {
@@ -174,12 +201,12 @@ async fn parse_options(argv: &[String]) -> Result<Options, ExitCode> {
             }
             'D' => o.debug = true,
             'h' => {
-                println!("{}", help::usage());
+                output::println(&help::usage());
                 return Err(ExitCode::SUCCESS);
             }
             'T' => o.target.scan_timeout = float_option(&value)?,
             'v' => {
-                println!("{}", help::version());
+                output::println(&help::version());
                 return Err(ExitCode::SUCCESS);
             }
             'f' => o.target.first_device = true,
@@ -218,8 +245,8 @@ async fn run_init_script(
     Ok(())
 }
 
-/// Runs the program; the connection goes to `connection` for closing it.
-async fn run(argv: Vec<String>, connection: &OnceLock<MeshCore>) -> ExitCode {
+/// Runs the program; what is to be closed at its end goes to `session`.
+async fn run(argv: Vec<String>, session: &OnceLock<Arc<App>>) -> ExitCode {
     let o = match parse_options(&argv).await {
         Ok(o) => o,
         Err(code) => return code,
@@ -234,16 +261,17 @@ async fn run(argv: Vec<String>, connection: &OnceLock<MeshCore>) -> ExitCode {
     if o.repeater_mode {
         let Some(port) = o.target.serial_port.clone() else {
             log::error!("Repeater mode (-r) requires serial port (-s)");
-            print!("{}", help::command_usage());
+            output::print(&help::command_usage());
             return ExitCode::FAILURE;
         };
         let (baudrate, color, commands) = (o.target.baudrate, o.settings.color, o.commands.clone());
-        // a port that cannot be opened is a failed connection (exit code 1)
-        let opened =
+        // a port that cannot be opened or stops working is a failed
+        // connection (exit code 1)
+        let connected =
             tokio::task::spawn_blocking(move || repeater::run(&port, baudrate, color, &commands))
                 .await
                 .unwrap_or(false);
-        return if opened {
+        return if connected {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -253,9 +281,9 @@ async fn run(argv: Vec<String>, connection: &OnceLock<MeshCore>) -> ExitCode {
     let Some(mc) = connect::connect(&o.target).await else {
         return ExitCode::FAILURE;
     };
-    let _ = connection.set(mc.clone());
 
     let app = Arc::new(App::new(mc, o.settings.clone()));
+    let _ = session.set(app.clone());
     let _events = display::spawn_event_task(app.clone());
     app.mc.set_auto_update_contacts(true);
     app.mc.set_decrypt_channel_logs(true);

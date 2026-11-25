@@ -12,9 +12,10 @@ mod chat;
 mod completion;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use rustyline::error::ReadlineError;
+use tokio::sync::watch;
 
 pub use chat::{FilterError, apply_command_to_contacts, process_contact_chat_line};
 
@@ -307,11 +308,11 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
             return;
         }
     };
-    let printer = editor.external_printer();
-    output::set_external_printer(printer);
+    editor.print_above_prompt();
 
     let mut last_ack = true;
-    loop {
+    // a prompt that cannot be shown ends the chat, as in the reference
+    while output::stdout_error().is_none() {
         // also without a scope, which resets one a failed change left
         nav.scope = app.set_scope(nav.scope.as_deref()).await;
 
@@ -402,7 +403,6 @@ pub async fn interactive_loop(app: &Arc<App>, json_output: bool) {
         }
     }
     IN_LOOP.store(false, std::sync::atomic::Ordering::Relaxed);
-    output::set_external_printer(None);
 }
 
 /// Result of processing a line: destination, scope and whether the last
@@ -443,6 +443,64 @@ fn report_spawn_error(e: &std::io::Error, pcom: &str, program: &str) {
         std::io::ErrorKind::PermissionDenied => log::error!("Permission denied: {pcom}"),
         _ => log::error!("Cannot pipe: {}", py::os_error(e, Some(program))),
     }
+}
+
+/// How many processes of redirections have not ended yet.
+static PROCESSES: LazyLock<watch::Sender<usize>> = LazyLock::new(|| watch::Sender::new(0));
+
+/// Counts a process of a redirection as running as long as this lives.
+struct Running;
+
+impl Running {
+    fn new() -> Self {
+        PROCESSES.send_modify(|n| *n += 1);
+        Self
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        PROCESSES.send_modify(|n| *n -= 1);
+    }
+}
+
+/// Waits until the processes of redirections ended. As in the reference, a
+/// Ctrl-C ends the chat only then: a pager keeps the terminal until it is
+/// done.
+pub async fn processes_ended() {
+    let _ = PROCESSES.subscribe().wait_for(|n| *n == 0).await;
+}
+
+/// A process that reads the output of a line.
+struct Reader(Option<(std::process::Child, Running)>);
+
+impl Reader {
+    /// Waits until the process ended.
+    async fn ended(mut self) {
+        if let Some((child, running)) = self.0.take() {
+            let wait = move || Self::wait(child, running);
+            let _ = tokio::task::spawn_blocking(wait).await;
+        }
+    }
+
+    fn wait(mut child: std::process::Child, _running: Running) {
+        let _ = child.wait();
+    }
+}
+
+impl Drop for Reader {
+    /// The line was given up, its process goes on until it ended.
+    fn drop(&mut self) {
+        if let Some((child, running)) = self.0.take() {
+            std::thread::spawn(move || Self::wait(child, running));
+        }
+    }
+}
+
+/// Lets a Ctrl-C take effect that ended a process, before the chat goes on
+/// to its next prompt.
+async fn pending_ctrl_c() {
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 }
 
 /// Handles redirections at the start of a line (`process_redirected_line`).
@@ -491,7 +549,6 @@ pub async fn process_redirected_line(
                     return unchanged();
                 }
                 if let Some(e) = file_sink.broken() {
-                    let e = py::os_error(e, None);
                     if append {
                         log::error!("Cannot append to file: {e}");
                     } else {
@@ -551,8 +608,11 @@ pub async fn process_redirected_line(
                 return unchanged();
             }
         };
-        let (result, broken) = match child.stdin.take() {
+        let stdin = child.stdin.take();
+        let reader = Reader(Some((child, Running::new())));
+        let (result, broken) = match stdin {
             Some(stdin) => {
+                // closed before the process is waited for
                 let mut child_sink = Sink::Child(stdin, None);
                 let result = Box::pin(process_redirected_line(
                     app,
@@ -563,13 +623,13 @@ pub async fn process_redirected_line(
                     end,
                 ))
                 .await;
-                let broken = child_sink.broken().map(|e| py::os_error(e, None));
-                drop(child_sink);
+                let broken = child_sink.broken();
                 (result, broken)
             }
             None => (unchanged(), None),
         };
-        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+        reader.ended().await;
+        pending_ctrl_c().await;
         // the redirection catches a ValueError of the line it runs, and
         // the BrokenPipeError of a process that stopped reading
         if let Err(Raised::Value(_)) = result {
@@ -620,18 +680,24 @@ pub async fn process_redirected_line(
         }
         // subprocess.run(..., capture_output=True, text=True): stdin stays
         // the terminal's
-        let output = match tokio::process::Command::new(&argv[0])
+        let mut command = std::process::Command::new(&argv[0]);
+        command
             .args(&argv[1..])
-            .stdin(std::process::Stdio::inherit())
-            .output()
-            .await
-        {
+            .stdin(std::process::Stdio::inherit());
+        let running = Running::new();
+        let output = tokio::task::spawn_blocking(move || {
+            let _running = running;
+            command.output()
+        })
+        .await;
+        let output = match output.map_err(std::io::Error::other).flatten() {
             Ok(output) => output,
             Err(e) => {
                 report_spawn_error(&e, &pcom, &argv[0]);
                 return unchanged();
             }
         };
+        pending_ctrl_c().await;
         // text=True decodes both outputs strictly (a UnicodeDecodeError is a
         // ValueError) and with universal newlines
         let (Ok(stdout), Ok(_)) = (

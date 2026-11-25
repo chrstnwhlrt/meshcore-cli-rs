@@ -253,6 +253,31 @@ impl Handlers {
         Ok((description, cmd))
     }
 
+    /// Ends all handlers when the program does: each gets the events still
+    /// queued for it, then the end of its input, and has time to finish
+    /// until the caller stops waiting.
+    pub async fn close(&self) {
+        let handlers = std::mem::take(&mut self.lock().handlers);
+        let mut endings = tokio::task::JoinSet::new();
+        for handler in handlers {
+            let Handler {
+                queue,
+                mut child,
+                tasks,
+                ..
+            } = handler;
+            drop(queue);
+            endings.spawn(async move {
+                let _ = child.wait().await;
+                // what it printed last
+                for task in tasks {
+                    let _ = task.await;
+                }
+            });
+        }
+        while endings.join_next().await.is_some() {}
+    }
+
     /// Queues an event for all handlers of `kind` (`enqueue_handler_event`).
     pub fn enqueue(&self, kind: &str, payload: &Value) {
         let guard = self.lock();
@@ -310,5 +335,26 @@ async fn relay<R: tokio::io::AsyncRead + Unpin>(mut reader: R) {
             Ok(0) | Err(_) => break,
             Ok(n) => output::print(&String::from_utf8_lossy(&buf[..n])),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closing_hands_over_the_last_events() {
+        let file = std::env::temp_dir().join(format!("mccli-handler-{}", std::process::id()));
+        let handlers = Handlers::default();
+        let cmd = format!("sh -c 'cat > \"$1\"' sh '{}'", file.display());
+        assert!(handlers.attach("msgs", &cmd).is_ok());
+        for n in 0..3 {
+            handlers.enqueue("msgs", &json!({ "n": n }));
+        }
+        let closed = tokio::time::timeout(Duration::from_secs(10), handlers.close()).await;
+        assert!(closed.is_ok());
+        let received = std::fs::read_to_string(&file).unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(received, "{\"n\": 0}\n{\"n\": 1}\n{\"n\": 2}\n");
     }
 }

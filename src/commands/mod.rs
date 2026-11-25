@@ -387,8 +387,8 @@ pub async fn process_cmds(
         let (next, output) = Box::pin(next_cmd(app, &cmds[pos..], json, sink, end)).await;
         sink.write(&output);
         sink.flush();
-        // a broken pipe to a process ends the commands, the `|` redirection
-        // reports it
+        // a full disk or a pipe nobody reads any more ends the commands; the
+        // redirection reports it, for stdout the end of the program
         if sink.broken().is_some() {
             return true;
         }
@@ -401,12 +401,18 @@ pub async fn process_cmds(
     true
 }
 
+/// How deep scripts may run scripts: as deep as the reference gets from the
+/// command line before Python's recursion limit ends a script that runs
+/// itself.
+const MAX_SCRIPT_DEPTH: usize = 328;
+
 /// Runs a script file (`process_script`); missing files are looked up in
 /// the configuration directory.
 ///
 /// # Errors
 ///
-/// A file that cannot be read gives Python's `OSError` message.
+/// A file that cannot be read gives Python's `OSError` message, scripts
+/// nested too deep give the one of its `RecursionError`.
 pub async fn process_script(
     app: &Arc<App>,
     file: &str,
@@ -425,8 +431,13 @@ pub async fn process_script(
         }
         return Ok(output);
     };
-    run_script_file(app, &path, json, sink).await?;
-    Ok(output)
+    let result = if app.script_depth.fetch_add(1, Ordering::Relaxed) < MAX_SCRIPT_DEPTH {
+        run_script_file(app, &path, json, sink).await
+    } else {
+        Err("maximum recursion depth exceeded".to_string())
+    };
+    app.script_depth.fetch_sub(1, Ordering::Relaxed);
+    result.map(|()| output)
 }
 
 async fn run_script_file(
@@ -454,6 +465,9 @@ async fn run_script_file(
                 }
             }
             Err(_) => log::error!("Error processing {line}"),
+        }
+        if sink.broken().is_some() {
+            break;
         }
     }
     Ok(())

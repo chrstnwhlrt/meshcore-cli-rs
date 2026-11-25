@@ -167,7 +167,7 @@ Everything lives in `~/.config/meshcore/` on all platforms. Files are only writt
 
 ## Differences to the Python reference
 
-BLE works on Linux only, through BlueZ. `-P` asks for the PIN in the terminal; in the reference it starts the pairing and the system's Bluetooth agent asks for the PIN.
+BLE works on Linux only, through BlueZ. `-P` asks for the PIN in the terminal; in the reference it starts the pairing and the system's Bluetooth agent asks for the PIN. The connection is closed however the program ends, also by SIGTERM or SIGHUP, since BlueZ would keep it up and the device does not advertise meanwhile.
 
 Fixed in this port, where the reference fails or prints wrong data:
 
@@ -197,7 +197,7 @@ Fixed in this port, where the reference fails or prints wrong data:
 - `lc` adds the distances (`d` in the format or the sort order) to its own output only. The reference also stores them in its contacts, so they show up in later JSON of the same run (`contact_info`, `lc -j`).
 - An `@alias` line with an unclosed quote is reported; the reference ends chat mode with a traceback.
 - A line of the `scopes` file that is not `<channel> <scope>` is reported as an error. The reference means to do that too, but its message is lost because logging is set up only after the file is read.
-- A `scopes` file, repeater mode script or region file that cannot be read or is not UTF-8 is reported as an error. The reference fails with a Python error, for `scopes` at every start and for a region file that is not UTF-8 after it sent part of it.
+- A `scopes` file, repeater mode script or region file that cannot be read or is not UTF-8, and a region file that cannot be written, are reported as an error. The reference fails with a Python error, for `scopes` at every start and for a region file that is not UTF-8 after it sent part of it.
 - A history file or `default_address` that cannot be read or written is left aside. With such a `default_address` the reference fails with a Python error at every start or after a BLE connection, and with such a history file prompt_toolkit shows errors instead of reading lines.
 - Typos and invisible non-breaking spaces in help texts and output are fixed, `?trace` gives 2 as the flag value of 4 byte hashes (the reference says 3), and the help lists all commands and parameters. It no longer offers `e` as short form of `card`, which the reference lists but does not know.
 
@@ -208,7 +208,10 @@ Behaves differently on purpose:
 - `sleep` and `trywait_msg` accept fractions of seconds, and `get max_attempts` exists next to `set max_attempts`.
 - Whole numbers beyond 64 bits are refused with "int too big to convert". Python reads them and fails only when it packs them for the device, partly with another message, or takes them as they are, for example as a retry count.
 - `-D` keeps debug logging with `-j` and `-q`; the reference switches back to errors only once it is connected.
-- Wrong options, failed connections and init scripts that cannot be read end with exit code 1 and the message of the reference; the reference ends with 0, after a failed connection or script also with a Python traceback.
+- Wrong options, failed connections (in repeater mode also one that breaks later) and init scripts that cannot be read end with exit code 1 and the message of the reference; the reference ends with 0, after a failed connection or script also with a Python traceback. Output that cannot be written, on a full disk or into a pipe nobody reads any more, ends the commands with exit code 1 as well; the reference ends them with 120.
+- A command line argument that is not UTF-8 is refused before anything runs. The reference takes it, and commands that send it fail. Such a line in chat mode or the repeater console is reported and skipped; the reference reads it as text it cannot send.
+- When the program ends, handlers get the events still queued for them and half a second to finish, and what they print then is shown. The reference kills them at once, so events they have not processed yet are lost.
+- A lost connection is logged ("connection lost: ..."), and commands fail at once after it; in the reference each one waits for its timeout.
 - `-l` prints "No ble device found" when no MeshCore device is in range. The reference prints it only when it sees no Bluetooth device at all.
 - A BLE device that another program on this computer is using is reported as in use after about 3 s. The reference tries to connect for 30 s, then scans for the device and reports that it cannot find it, since a connected device does not advertise.
 - Device errors and timeouts read like `device error 6 (ERR_CODE_ILLEGAL_ARG)` or `timed out` instead of a Python object, and `handlers` and the JSON of `handler_attach` and `handler_detach` leave out internal Python objects.

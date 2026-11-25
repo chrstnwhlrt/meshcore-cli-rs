@@ -3,10 +3,9 @@
 //! BLE goes through `BlueZ` and exists on Linux with the `ble` feature only;
 //! elsewhere the BLE options are accepted and ignored.
 
-use std::io::Write as _;
-
 use meshcore::MeshCore;
 
+use crate::output;
 use crate::util::text::pad_right;
 
 /// Whether this build can use BLE.
@@ -301,24 +300,25 @@ async fn ble_scan(_timeout: f64) -> Result<Vec<BleEntry>, meshcore::Error> {
 /// `-l`: prints BLE devices and serial ports.
 pub async fn list_devices(timeout: f64, repeater_mode: bool) {
     if BLE && !repeater_mode {
-        println!("BLE devices:");
+        output::println("BLE devices:");
         match ble_scan(timeout).await {
-            Ok(devices) if devices.is_empty() => println!(" No ble device found"),
+            Ok(devices) if devices.is_empty() => output::println(" No ble device found"),
             Ok(devices) => {
                 for d in devices {
-                    println!(" {}  {}", d.address, d.name);
+                    output::println(&format!(" {}  {}", d.address, d.name));
                 }
             }
             Err(e) => {
                 log::debug!("BLE scan: {e}");
-                println!(" No BLE HW");
+                output::println(" No BLE HW");
             }
         }
-        println!();
+        output::println("");
     }
-    println!("Serial ports:");
+    output::println("Serial ports:");
     for p in serial_ports() {
-        println!(" {} {} [{}]", pad_right(&p.port, 18), p.desc, p.hwid);
+        let port = pad_right(&p.port, 18);
+        output::println(&format!(" {port} {} [{}]", p.desc, p.hwid));
     }
 }
 
@@ -360,13 +360,12 @@ pub async fn select_device(timeout: f64, repeater_mode: bool) -> Option<Selectio
         log::error!("No device found, exiting");
         return None;
     }
-    println!("MeshCore-cli device selector");
-    println!("Choose the device to connect to :");
+    output::println("MeshCore-cli device selector");
+    output::println("Choose the device to connect to :");
     for (i, (_, label)) in choices.iter().enumerate() {
-        println!(" {:>2}) {label}", i + 1);
+        output::println(&format!(" {:>2}) {label}", i + 1));
     }
-    print!("Number (Enter to cancel): ");
-    let _ = std::io::stdout().flush();
+    output::print("Number (Enter to cancel): ");
     let mut line = String::new();
     let read =
         tokio::task::spawn_blocking(move || std::io::stdin().read_line(&mut line).map(|_| line))
@@ -388,7 +387,7 @@ pub async fn connect(target: &Target) -> Option<MeshCore> {
     if let Some(host) = &target.hostname {
         let Ok(port) = u16::try_from(target.port) else {
             // the OverflowError of Python's socket, which the reference prints
-            println!("Error: connect(): port must be 0-65535.");
+            output::println("Error: connect(): port must be 0-65535.");
             return None;
         };
         return connect_tcp(host, port).await;
@@ -396,7 +395,8 @@ pub async fn connect(target: &Target) -> Option<MeshCore> {
     if let Some(port) = &target.serial_port {
         let Some(baud_rate) = serial_baudrate(target.baudrate) else {
             // pyserial's ValueError, which the reference prints and ends with
-            println!("Error: Not a valid baudrate: {}", target.baudrate);
+            let baudrate = target.baudrate;
+            output::println(&format!("Error: Not a valid baudrate: {baudrate}"));
             return None;
         };
         let config = meshcore::SerialConfig {
@@ -420,7 +420,7 @@ pub async fn connect(target: &Target) -> Option<MeshCore> {
             // pyserial's exception, which the reference prints and ends with
             Err(e) => {
                 let message = pyserial_open_error(port).unwrap_or_else(|| e.to_string());
-                println!("Error: {message}");
+                output::println(&format!("Error: {message}"));
                 None
             }
         };
@@ -437,7 +437,7 @@ async fn connect_tcp(host: &str, port: u16) -> Option<MeshCore> {
         match tokio::net::lookup_host((host.to_string(), port)).await {
             Ok(addresses) => addresses.collect(),
             Err(e) => {
-                println!("Error: {}", lookup_error(&e));
+                output::println(&format!("Error: {}", lookup_error(&e)));
                 return None;
             }
         };
@@ -460,7 +460,7 @@ async fn connect_tcp(host: &str, port: u16) -> Option<MeshCore> {
         [first, rest @ ..] if rest.iter().all(|e| e == first) => first.clone(),
         all => format!("Multiple exceptions: {}", all.join(", ")),
     };
-    println!("Error: {message}");
+    output::println(&format!("Error: {message}"));
     None
 }
 
@@ -572,20 +572,20 @@ pub fn serial_baudrate(baudrate: i64) -> Option<u32> {
 #[cfg(not(all(feature = "ble", target_os = "linux")))]
 #[allow(clippy::unused_async)]
 async fn connect_ble(_target: &Target) -> Option<MeshCore> {
-    println!("No device given: use -s <serial port> or -t <host> (no BLE in this build)");
-    print!("{}", crate::help::command_usage());
+    output::println("No device given: use -s <serial port> or -t <host> (no BLE in this build)");
+    output::print(&crate::help::command_usage());
     None
 }
 
 /// The message of the reference when BLE cannot be used at all.
 #[cfg(all(feature = "ble", target_os = "linux"))]
 fn no_ble_hardware() {
-    println!("BLE connection asked (default behaviour), but no BLE HW found");
-    println!(
+    output::println("BLE connection asked (default behaviour), but no BLE HW found");
+    output::println(&format!(
         "Call {} with -h for some more help (on commands)",
         crate::help::PROGRAM
-    );
-    print!("{}", crate::help::command_usage());
+    ));
+    output::print(&crate::help::command_usage());
 }
 
 /// A full Bluetooth address (`AA:BB:CC:DD:EE:FF`) needs no scan.

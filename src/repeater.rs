@@ -12,6 +12,7 @@ use serialport::{ClearBuffer, SerialPort};
 
 use crate::editor::{Completion, CompletionTree, LineEditor, StyledPrompt};
 use crate::help;
+use crate::output;
 use crate::paths;
 use crate::util::text::escape_ansi;
 use crate::util::time::{format_local, now_secs};
@@ -20,14 +21,23 @@ use crate::util::{ansi, py};
 /// Read timeout of the serial port, like `pyserial.Serial(timeout=1)`.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How deep scripts may run scripts; one that runs itself ends there with
+/// the message of Python's `RecursionError`.
+const MAX_SCRIPT_DEPTH: usize = 100;
+
+/// What an exchange with the repeater gives, or the message of the
+/// exception that ends the reference, as when the device is unplugged.
+type Exchange<T> = Result<T, String>;
+
 /// An open connection to a repeater console.
 pub struct Repeater {
     port: Box<dyn SerialPort>,
     color: bool,
+    script_depth: usize,
 }
 
 impl Repeater {
-    /// Opens the serial port and wakes up the console.
+    /// Opens the serial port.
     ///
     /// # Errors
     ///
@@ -63,115 +73,144 @@ impl Repeater {
                     ansi::END
                 )
             })?;
-        let mut repeater = Self { port, color };
+        Ok(Self {
+            port,
+            color,
+            script_depth: 0,
+        })
+    }
+
+    /// Wakes up the console.
+    fn wake(&mut self) -> Exchange<()> {
         std::thread::sleep(Duration::from_millis(500));
-        repeater.clear_input();
-        repeater.write("\r");
+        self.clear_input()?;
+        self.write("\r")?;
         std::thread::sleep(Duration::from_millis(200));
-        repeater.clear_input();
-        Ok(repeater)
+        self.clear_input()
     }
 
-    fn clear_input(&mut self) {
-        let _ = self.port.clear(ClearBuffer::Input);
+    fn clear_input(&mut self) -> Exchange<()> {
+        // the termios.error of tcflush
+        self.port
+            .clear(ClearBuffer::Input)
+            .map_err(|e| match device_gone(&e.description) {
+                Some((errno, text)) => {
+                    format!("({errno}, {})", crate::util::json::py_repr_str(&text))
+                }
+                None => e.description,
+            })
     }
 
-    fn write(&mut self, text: &str) {
-        let _ = self.port.write_all(text.as_bytes());
+    fn write(&mut self, text: &str) -> Exchange<()> {
+        let mut rest = text.as_bytes();
+        while !rest.is_empty() {
+            match self.port.write(rest) {
+                Ok(written) => rest = &rest[written..],
+                // not ready yet; pyserial waits without limit
+                Err(e) if is_wait(&e) => {}
+                Err(e) => return Err(format!("write failed: {}", os_error(&e.to_string()))),
+            }
+        }
+        // the bytes are out; a device gone since shows up with the next
         let _ = self.port.flush();
+        Ok(())
     }
 
     /// Prints a line, removing colors when they are disabled.
     fn print(&self, text: &str) {
-        println!("{}", paint(self.color, text));
+        output::println(&paint(self.color, text));
+    }
+
+    /// Reads what has come, at most `buf`; 0 when nothing has.
+    fn read_some(&mut self, buf: &mut [u8]) -> Exchange<usize> {
+        match self.port.read(buf) {
+            Ok(n) if n > 0 => Ok(n),
+            Err(e) if is_wait(&e) => Ok(0),
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+                Err(format!("read failed: {}", os_error(&e.to_string())))
+            }
+            Ok(_) | Err(_) => Err(
+                "device reports readiness to read but returned no data (device disconnected \
+                 or multiple access on port?)"
+                    .to_string(),
+            ),
+        }
     }
 
     /// Reads up to `size` bytes, waiting at most one second.
-    fn read(&mut self, size: usize) -> Vec<u8> {
+    fn read(&mut self, size: usize) -> Exchange<Vec<u8>> {
         let deadline = Instant::now() + READ_TIMEOUT;
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
         while out.len() < size && Instant::now() < deadline {
             let want = (size - out.len()).min(buf.len());
-            match self.port.read(&mut buf[..want]) {
-                Ok(0) => {}
-                Ok(n) => out.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => break,
-            }
+            let n = self.read_some(&mut buf[..want])?;
+            out.extend_from_slice(&buf[..n]);
         }
-        out
+        Ok(out)
     }
 
     /// Reads one line (up to `\n`), waiting at most one second.
-    fn read_line(&mut self) -> String {
+    fn read_line(&mut self) -> Exchange<String> {
         let deadline = Instant::now() + READ_TIMEOUT;
         let mut out = Vec::new();
         let mut byte = [0u8; 1];
-        while Instant::now() < deadline {
-            match self.port.read(&mut byte) {
-                Ok(1) => {
-                    out.push(byte[0]);
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => break,
-            }
+        while Instant::now() < deadline && out.last() != Some(&b'\n') {
+            let n = self.read_some(&mut byte)?;
+            out.extend_from_slice(&byte[..n]);
         }
-        decode_ignore(&out)
+        Ok(decode_ignore(&out))
     }
 
     /// Asks the repeater for its name.
-    pub fn name(&mut self) -> String {
-        self.write("get name\r");
+    fn name(&mut self) -> Exchange<String> {
+        self.write("get name\r")?;
         let mut line = String::new();
         let mut tries = 0;
         while !line.starts_with("get name") {
-            line = py::rstrip(&self.read_line()).to_string();
+            line = py::rstrip(&self.read_line()?).to_string();
             tries += 1;
             if tries > 30 {
                 log::error!("Could not retrieve name");
-                return "UNKNOWN".to_string();
+                return Ok("UNKNOWN".to_string());
             }
         }
-        let line = py::rstrip(&self.read_line()).to_string();
-        line.strip_prefix("  -> > ")
-            .map_or_else(|| "Repeater".to_string(), str::to_string)
+        let line = py::rstrip(&self.read_line()?).to_string();
+        Ok(line
+            .strip_prefix("  -> > ")
+            .map_or_else(|| "Repeater".to_string(), str::to_string))
     }
 
     /// Asks the repeater for its firmware version.
-    pub fn version(&mut self) -> String {
-        self.write("ver\r");
-        let mut line = py::rstrip(&self.read_line()).to_string();
+    fn version(&mut self) -> Exchange<String> {
+        self.write("ver\r")?;
+        let mut line = py::rstrip(&self.read_line()?).to_string();
         let mut tries = 0;
         while line != "ver" {
-            line = py::rstrip(&self.read_line()).to_string();
+            line = py::rstrip(&self.read_line()?).to_string();
             tries += 1;
             if tries > 30 {
                 log::error!("Error reading version");
-                return "unknown".to_string();
+                return Ok("unknown".to_string());
             }
         }
-        let line = py::rstrip(&self.read_line()).to_string();
-        if line.starts_with("  -> ") {
+        let line = py::rstrip(&self.read_line()?).to_string();
+        Ok(if line.starts_with("  -> ") {
             line.chars().skip(6).collect()
         } else {
             "unknown".to_string()
-        }
+        })
     }
 
     /// Processes one command line; returns false when the repeater reported
     /// an error (used to stop scripts).
-    pub fn process_line(&mut self, input: &str, echo: bool, name: Option<&str>) -> bool {
+    fn process_line(&mut self, input: &str, echo: bool, name: Option<&str>) -> Exchange<bool> {
         let lower = input.to_lowercase();
         let mut cmd = input.to_string();
 
         if lower == "help" {
             self.print(&help::repeater_help());
-            return true;
+            return Ok(true);
         }
 
         if lower == "clock sync" || lower == "st" || lower == "sync_time" {
@@ -188,32 +227,32 @@ impl Repeater {
         if lower.starts_with("region upload") || lower.starts_with("region load") {
             let Some(file) = file_argument(input, 2) else {
                 log::info!("Region upload canceled");
-                return false;
+                return Ok(false);
             };
             let path = paths::expand_user(&file);
             let content = match py::read_text(&path, py::TextRead::Lines) {
                 Ok(content) => content,
                 Err(py::TextError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     log::error!("File not found");
-                    return false;
+                    return Ok(false);
                 }
                 // the reference fails with these errors, with a decode
                 // error only after sending part of the file
                 Err(e) => {
                     log::error!("{}", e.message(&path.display().to_string()));
-                    return false;
+                    return Ok(false);
                 }
             };
-            self.write("region load\r");
+            self.write("region load\r")?;
             for line in py::lines(&content) {
                 if py::strip(line).is_empty() {
                     break;
                 }
                 if !line.starts_with(';') {
-                    self.write(&format!("{}\r", py::rstrip(line)));
+                    self.write(&format!("{}\r", py::rstrip(line)))?;
                 }
             }
-            self.write("\r");
+            self.write("\r")?;
             // send nothing more, just collect the answer below
             cmd = String::new();
         }
@@ -221,7 +260,7 @@ impl Repeater {
         if lower.starts_with("region download") {
             let Some(file) = file_argument(input, 2) else {
                 log::info!("Region download canceled");
-                return false;
+                return Ok(false);
             };
             return self.download_regions(&file, name);
         }
@@ -229,24 +268,25 @@ impl Repeater {
         if lower.starts_with("script") {
             let Some(file) = file_argument(input, 1) else {
                 log::info!("Script canceled");
-                return false;
+                return Ok(false);
             };
             return self.run_script(&paths::expand_user(&file));
         }
 
         if !cmd.is_empty() {
-            self.write(&format!("{cmd}\r"));
+            self.write(&format!("{cmd}\r"))?;
         }
         std::thread::sleep(Duration::from_millis(300));
 
         let waiting = self
             .port
             .bytes_to_read()
+            .map_err(|e| os_error(&e.description))?;
+        let waiting = usize::try_from(waiting)
             .ok()
-            .and_then(|n| usize::try_from(n).ok())
             .filter(|&n| n > 0)
             .unwrap_or(4096);
-        let response = decode_ignore(&self.read(waiting));
+        let response = decode_ignore(&self.read(waiting)?);
         let mut result = true;
         if !response.is_empty() {
             for line in py::rstrip(&response).split('\n') {
@@ -268,45 +308,52 @@ impl Repeater {
                 }
             }
         }
-        result
+        Ok(result)
     }
 
-    fn download_regions(&mut self, file: &str, name: Option<&str>) -> bool {
+    fn download_regions(&mut self, file: &str, name: Option<&str>) -> Exchange<bool> {
         let path = paths::expand_user(file);
         let mut out = match std::fs::File::create(&path) {
             Ok(out) => out,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 log::error!("File not found");
-                return false;
+                return Ok(false);
             }
             // the reference fails with this error
             Err(e) => {
                 log::error!("{}", py::os_error(&e, Some(&path.display().to_string())));
-                return false;
+                return Ok(false);
             }
         };
-        let name = name.map_or_else(|| self.name(), str::to_string);
-        let header = format!(
+        let name = match name {
+            Some(name) => name.to_string(),
+            None => self.name()?,
+        };
+        let mut spec = format!(
             "; Regions spec downloaded from {name}\n; On {}\n",
             format_local(now_secs(), "%a %d %b %Y %H:%M %z")
         );
-        let _ = out.write_all(header.as_bytes());
 
-        self.write("region\r");
-        let mut line = self.read_line();
+        self.write("region\r")?;
+        let mut line = self.read_line()?;
         let mut tries = 0;
         while !line.starts_with("  ->") {
-            line = self.read_line();
+            line = self.read_line()?;
             tries += 1;
             if tries > 30 {
                 log::error!("Error while communicating with target for downloading region");
-                return false;
+                return Ok(false);
             }
         }
         let mut line: String = line.chars().skip(5).collect();
         while !py::rstrip(&line).is_empty() {
-            let _ = out.write_all(line.as_bytes());
-            line = self.read_line();
+            spec.push_str(&line);
+            line = self.read_line()?;
+        }
+        // the reference fails with this error
+        if let Err(e) = out.write_all(spec.as_bytes()) {
+            log::error!("{}", py::os_error(&e, None));
+            return Ok(false);
         }
         log::info!(
             "{}",
@@ -320,40 +367,46 @@ impl Repeater {
                 )
             )
         );
-        true
+        Ok(true)
     }
 
-    fn run_script(&mut self, file: &Path) -> bool {
+    fn run_script(&mut self, file: &Path) -> Exchange<bool> {
         if !file.exists() {
             log::info!("file {} not found", file.display());
-            return false;
+            return Ok(false);
         }
         let content = match py::read_text(file, py::TextRead::Lines) {
             Ok(content) => content,
             // the reference fails with these errors
             Err(e) => {
                 log::error!("{}", e.message(&file.display().to_string()));
-                return false;
+                return Ok(false);
             }
         };
+        if self.script_depth >= MAX_SCRIPT_DEPTH {
+            return Err("maximum recursion depth exceeded".to_string());
+        }
         for line in py::lines(&content) {
             let line = py::strip(line);
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             log::debug!("processing {line}");
-            if !self.process_line(line, true, None) {
+            self.script_depth += 1;
+            let result = self.process_line(line, true, None)?;
+            self.script_depth -= 1;
+            if !result {
                 log::info!("Error during script execution, exiting");
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Runs the interactive loop.
-    pub fn interactive(&mut self) {
-        let name = self.name();
-        let version = self.version();
+    fn interactive(&mut self) -> Exchange<()> {
+        let name = self.name()?;
+        let version = self.version()?;
         self.print(&format!(
             "{}Connected!{} Device: {}{name}{} version {}{version}{}",
             ansi::BGREEN,
@@ -368,14 +421,14 @@ impl Repeater {
             c = ansi::BCYAN,
             e = ansi::END
         ));
-        println!("{}", "-".repeat(50));
+        self.print(&"-".repeat(50));
 
         let history = paths::existing_config_dir().map(|_| paths::repeater_history_file());
         let mut editor = match LineEditor::new(history) {
             Ok(e) => e,
             Err(e) => {
                 log::error!("Cannot start line editor: {e}");
-                return;
+                return Ok(());
             }
         };
         editor.set_completion(Completion::Nested {
@@ -397,9 +450,55 @@ impl Repeater {
             if matches!(cmd.to_lowercase().as_str(), "quit" | "exit" | "q") {
                 break;
             }
-            self.process_line(&cmd, false, Some(&name));
+            self.process_line(&cmd, false, Some(&name))?;
+            // a prompt that cannot be shown ends the loop, as in the reference
+            if output::stdout_error().is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs the commands of the command line, or else the loop.
+    fn talk(&mut self, args: &[String]) -> Exchange<()> {
+        self.wake()?;
+        log::debug!(
+            "Serial port opened: {}",
+            self.port.name().unwrap_or_default()
+        );
+        if args.is_empty() {
+            self.interactive()
+        } else {
+            self.process_line(&args.join(" "), false, None).map(|_| ())
         }
     }
+}
+
+/// Whether the port is only not ready yet.
+fn is_wait(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
+    matches!(e.kind(), TimedOut | WouldBlock | Interrupted)
+}
+
+/// The error of a port whose device is gone, EIO on Linux: its number and
+/// text. The serialport crate does not pass the number on, only its own
+/// text, here for that error and for a port that hung up.
+#[cfg(unix)]
+fn device_gone(description: &str) -> Option<(i32, String)> {
+    matches!(description, "I/O error" | "Broken pipe").then(|| (libc::EIO, py::strerror(libc::EIO)))
+}
+
+#[cfg(not(unix))]
+fn device_gone(_description: &str) -> Option<(i32, String)> {
+    None
+}
+
+/// The text of Python's `OSError` for an error of a port.
+fn os_error(description: &str) -> String {
+    device_gone(description).map_or_else(
+        || description.to_string(),
+        |(errno, text)| format!("[Errno {errno}] {text}"),
+    )
 }
 
 /// Returns the file name argument (everything from word `index` on, keeping
@@ -549,21 +648,19 @@ pub fn completion_tree() -> CompletionTree {
 }
 
 /// Runs repeater mode: one command from the command line, or the loop.
-/// Returns false when the port could not be opened.
+/// Returns false when the port could not be opened or the device is gone.
 #[must_use]
 pub fn run(port: &str, baudrate: i64, color: bool, args: &[String]) -> bool {
     let mut repeater = match Repeater::open(port, baudrate, color) {
         Ok(r) => r,
         Err(message) => {
-            println!("{}", paint(color, &message));
+            output::println(&paint(color, &message));
             return false;
         }
     };
-    log::debug!("Serial port opened: {port}");
-    if args.is_empty() {
-        repeater.interactive();
-    } else {
-        repeater.process_line(&args.join(" "), false, None);
+    if let Err(message) = repeater.talk(args) {
+        output::println(&format!("Error: {message}"));
+        return false;
     }
     log::info!(
         "{}",
@@ -605,6 +702,14 @@ mod tests {
         assert_eq!(decode_ignore(b"ok\xff\xfe done"), "ok done");
         // a replacement character sent as such stays
         assert_eq!(decode_ignore(b"a\xef\xbf\xbdb\xe2\x82"), "a\u{fffd}b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn port_errors_like_pyserial() {
+        assert_eq!(os_error("I/O error"), "[Errno 5] Input/output error");
+        assert_eq!(os_error("Broken pipe"), "[Errno 5] Input/output error");
+        assert_eq!(os_error("something else"), "something else");
     }
 
     #[test]
