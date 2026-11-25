@@ -188,6 +188,7 @@ Fixed in this port, where the reference fails or prints wrong data:
 - `reset_advert_time` with an unknown contact says so; the reference fails with a Python error.
 - `get custom` and `get <variable>` with `-j` print a failed request as `{"error": ...}`; the reference fails with a Python error.
 - `get private_key` on a device that does not export its key says so; the reference fails with a Python error.
+- `sync_time` (also `st` and `clock sync`) reports a timeout or an error reply without a code like any other error and goes on with the next command. The reference fails there with a Python error and skips the commands after it.
 - `set tx` takes values up to 127. The reference sends larger ones too, and the device reads only their lowest byte, so 276 sets 20 dBm.
 - `set radio` rounds the frequency to whole kHz and the bandwidth to whole Hz. The reference cuts off the rest after a float multiplication, so it sets 869.462 MHz for 869.4625 and 512.001 MHz for 512.002.
 - `add_contact` with a key that is not 32 bytes long reports the command format. The reference sends it, and the device reads the fields after the key into it.

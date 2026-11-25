@@ -213,22 +213,22 @@ async fn handle_message(app: &App, payload: Value, event_type: &str) {
 }
 
 /// Handles a received packet log (`handle_log_rx`).
-fn handle_log_rx(app: &App, mut payload: Value) {
+fn handle_log_rx(app: &App, payload: &Value) {
     let settings = app.settings().clone();
-    let payload_type = vint(&payload, "payload_type");
+    let payload_type = vint(payload, "payload_type");
     let mut lines = String::new();
 
     if payload_type == 0x05 && settings.channel_echoes {
-        let mut chan_name = vstr(&payload, "chan_name");
+        let mut chan_name = vstr(payload, "chan_name");
         let mut message = None;
         if payload.get("message").is_some() {
-            message = Some(vstr(&payload, "message"));
+            message = Some(vstr(payload, "message"));
         } else if settings.echo_unk_chans || !chan_name.is_empty() {
             if chan_name.is_empty() {
-                chan_name = vstr(&payload, "chan_hash");
+                chan_name = vstr(payload, "chan_hash");
             }
             message = Some(if payload.get("crypted").is_some() {
-                vstr(&payload, "crypted")
+                vstr(payload, "crypted")
             } else {
                 "-- unhandled --".to_string()
             });
@@ -237,13 +237,13 @@ fn handle_log_rx(app: &App, mut payload: Value) {
             // computed with signs like the reference: in a narrow terminal
             // or with a long path the text loses characters at the back
             let width = signed(terminal_width());
-            let path = vstr(&payload, "path");
+            let path = vstr(payload, "path");
             let path_len = signed(path.chars().count());
             let cars = width - 13 - path_len - signed(chan_name.chars().count()) - 1;
             let dispmsg = slice_to(&message.replace('\n', ""), cars);
             let pad = usize::try_from(cars - signed(dispmsg.chars().count())).unwrap_or(0);
             let snr = payload.get("snr").and_then(Value::as_f64).unwrap_or(0.0);
-            let rssi = vint(&payload, "rssi");
+            let rssi = vint(payload, "rssi");
             // with a COLUMNS value beyond the memory the reference fails
             // building the padding and drops the rest of the event
             if lines.try_reserve(pad).is_err() {
@@ -268,15 +268,15 @@ fn handle_log_rx(app: &App, mut payload: Value) {
             );
         }
     } else if payload_type == 0x04 && settings.advert_echoes {
-        let key = vstr(&payload, "adv_key");
+        let key = vstr(payload, "adv_key");
         let name = if payload.get("adv_name").is_some() {
-            vstr(&payload, "adv_name")
+            vstr(payload, "adv_name")
         } else {
             app.mc
                 .get_contact_by_key_prefix(&key)
                 .map_or_else(|| key.chars().take(12).collect(), |c| c.name.clone())
         };
-        let ts_str = format_print_timestamp(&settings.timestamp, vint(&payload, "adv_timestamp"))
+        let ts_str = format_print_timestamp(&settings.timestamp, vint(payload, "adv_timestamp"))
             .map(|t| format!(" at {t}"))
             .unwrap_or_default();
         let mut txt = format!(
@@ -284,7 +284,7 @@ fn handle_log_rx(app: &App, mut payload: Value) {
             ansi::LIGHT_GRAY,
             ansi::END,
             ansi::GREEN,
-            type_name(vint(&payload, "adv_type")),
+            type_name(vint(payload, "adv_type")),
             ansi::END
         );
         if let Some(lat) = payload.get("adv_lat").filter(|v| !v.is_null()) {
@@ -301,7 +301,7 @@ fn handle_log_rx(app: &App, mut payload: Value) {
             txt,
             " {}path: [{}] {}snr: {snr:.2}dB{}",
             ansi::YELLOW,
-            vstr(&payload, "path"),
+            vstr(payload, "path"),
             ansi::LIGHT_GRAY,
             ansi::END
         );
@@ -316,24 +316,12 @@ fn handle_log_rx(app: &App, mut payload: Value) {
         });
     }
 
-    // pkt_payload is already hex in the library's payload
-    if let Value::Object(map) = &mut payload
-        && let Some(Value::Array(bytes)) = map.get("pkt_payload")
-    {
-        let raw: Vec<u8> = bytes
-            .iter()
-            .filter_map(Value::as_u64)
-            .filter_map(|b| u8::try_from(b).ok())
-            .collect();
-        map.insert(
-            "pkt_payload".into(),
-            Value::String(crate::util::text::hex_lower(&raw)),
-        );
-    }
+    // the reference turns pkt_payload into hex here; the library's payload
+    // holds it as hex already
     if settings.json_log_rx {
-        output::println(&dumps(&payload));
+        output::println(&dumps(payload));
     }
-    app.handlers.enqueue("rxlog", &payload);
+    app.handlers.enqueue("rxlog", payload);
 }
 
 /// Prints a note about an advert (`handle_advert`).
@@ -399,7 +387,7 @@ pub fn spawn_event_task(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 Event::Advertisement(key) => handle_advert(&app, &key.to_string()),
                 Event::PathUpdate(key) => handle_path_update(&app, &key.to_string()),
                 Event::NewContact(_) => handle_new_contact(&app, &to_value(&event)),
-                Event::RxLog(_) => handle_log_rx(&app, to_value(&event)),
+                Event::RxLog(_) => handle_log_rx(&app, &to_value(&event)),
                 Event::ContactMessage(_) | Event::ChannelMessage(_) | Event::ChannelData(_)
                     if app.msgs_subscribed.load(Ordering::Relaxed) =>
                 {
