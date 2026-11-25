@@ -24,7 +24,7 @@ ble = ["meshcore/ble"]
 
 [dependencies]
 # MeshCore protocol library, at the release this CLI is tested with
-meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs", tag = "v0.10.14", features = ["serde"] }
+meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs", tag = "v0.10.15", features = ["serde"] }
 
 # Async runtime, child processes of handlers (their output read through a
 # pipe), signals, the name lookup for TCP connections
