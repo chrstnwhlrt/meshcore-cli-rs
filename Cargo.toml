@@ -1,6 +1,6 @@
 [package]
 name = "meshcore-cli-rs"
-version = "0.10.7"
+version = "0.10.8"
 edition = "2024"
 # rustyline 19 uses cfg_select!, stable since Rust 1.95 (1.94 fails, 1.95
 # builds and passes the tests)
