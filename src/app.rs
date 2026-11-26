@@ -513,7 +513,13 @@ impl App {
         }
         let result = match scope {
             Some(scope) => self.mc.set_flood_scope_str(scope).await,
-            None => self.mc.reset_flood_scope().await,
+            // the reference's set_flood_scope(None): the zero key, where
+            // reset_flood_scope sends the command without a key
+            None => {
+                self.mc
+                    .set_flood_scope(&meshcore::FloodScope::Default)
+                    .await
+            }
         };
         match result {
             Ok(()) => {
