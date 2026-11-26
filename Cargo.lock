@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "meshcore-cli-rs"
-version = "0.10.9"
+version = "0.10.10"
 dependencies = [
  "jiff",
  "libc",
