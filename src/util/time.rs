@@ -31,7 +31,67 @@ pub fn now_u32() -> u32 {
 /// (see [`crate::util::strftime`]).
 #[must_use]
 pub fn format_local(timestamp: i64, pattern: &str) -> String {
-    crate::util::strftime::strftime(timestamp, pattern, &TimeZone::system())
+    crate::util::strftime::strftime(timestamp, pattern, &local_zone())
+}
+
+/// The local time zone, chosen once. A set `TZ` names a file first, as
+/// glibc's `tzset` reads it for the reference: see [`zone_file`]. The rest
+/// is left to jiff: an unset `TZ` (the zone of `/etc/localtime`), POSIX
+/// rules, and names glibc does not find (in another case, or in a
+/// zoneinfo directory other than `TZDIR` and `/usr/share/zoneinfo`).
+#[must_use]
+pub fn local_zone() -> TimeZone {
+    static ZONE: std::sync::OnceLock<TimeZone> = std::sync::OnceLock::new();
+    ZONE.get_or_init(|| {
+        zone_file(
+            std::env::var("TZ").ok().as_deref(),
+            std::env::var_os("TZDIR").as_deref(),
+        )
+        .unwrap_or_else(TimeZone::system)
+    })
+    .clone()
+}
+
+/// The zone of the file a `TZ` value names, without a leading `:`: an
+/// absolute path, or a path under `tzdir` (`/usr/share/zoneinfo` when
+/// unset or empty) taken as written, so that `posix/Europe/Berlin` or
+/// `./Europe/Berlin` work as in glibc. Only regular files are read, at
+/// most 1 MiB of them. Anything else there, like a directory or
+/// `/dev/zero`, gives UTC as in glibc; jiff would read a device until the
+/// memory runs out.
+#[cfg(unix)]
+fn zone_file(tz: Option<&str>, tzdir: Option<&std::ffi::OsStr>) -> Option<TimeZone> {
+    use std::io::Read;
+    let name = tz?;
+    let name = name.strip_prefix(':').unwrap_or(name);
+    if name.is_empty() {
+        return None;
+    }
+    let path = if name.starts_with('/') {
+        std::path::PathBuf::from(name)
+    } else {
+        let dir = tzdir
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| "/usr/share/zoneinfo".as_ref());
+        std::path::Path::new(dir).join(name)
+    };
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return Some(TimeZone::UTC);
+    }
+    let mut data = Vec::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(1 << 20)
+        .read_to_end(&mut data)
+        .ok()?;
+    TimeZone::tzif(name, &data).ok()
+}
+
+/// Outside Unix the reference's C library reads `TZ` its own way; jiff
+/// decides there.
+#[cfg(not(unix))]
+fn zone_file(_tz: Option<&str>, _tzdir: Option<&std::ffi::OsStr>) -> Option<TimeZone> {
+    None
 }
 
 /// Formats a message or advert timestamp the way `print_timestamp` asks for.
@@ -207,5 +267,55 @@ mod tests {
     #[test]
     fn unknown_directives_are_copied() {
         assert_eq!(format_local(0, "%Q%"), "%Q%");
+    }
+
+    /// A `TZif` file of a fixed zone 5:30 east of UTC (`<+0530>-5:30`):
+    /// the version 1 block, the same as version 2 block, the rule.
+    fn tzif_plus_0530() -> Vec<u8> {
+        let mut data = Vec::new();
+        for _ in 0..2 {
+            data.extend_from_slice(b"TZif2");
+            data.extend_from_slice(&[0; 15]);
+            // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+            for count in [0u32, 0, 0, 0, 1, 6] {
+                data.extend_from_slice(&count.to_be_bytes());
+            }
+            data.extend_from_slice(&19_800_i32.to_be_bytes());
+            data.extend_from_slice(&[0, 0]);
+            data.extend_from_slice(b"+0530\0");
+        }
+        data.extend_from_slice(b"\n<+0530>-5:30\n");
+        data
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zone_files_are_found_like_glibc() {
+        let dir = std::env::temp_dir().join(format!("mccli-tz-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("posix/Asia")).unwrap();
+        std::fs::write(dir.join("posix/Asia/Kolkata"), tzif_plus_0530()).unwrap();
+        std::fs::write(dir.join("broken"), b"not a zone").unwrap();
+        let at = |tz: &str, tzdir: Option<&std::path::Path>| {
+            zone_file(Some(tz), tzdir.map(std::path::Path::as_os_str))
+                .map(|zone| crate::util::strftime::strftime(0, "%H:%M", &zone))
+        };
+        let some = Some(dir.as_path());
+        assert_eq!(at("posix/Asia/Kolkata", some).as_deref(), Some("05:30"));
+        assert_eq!(at(":./posix//Asia/Kolkata", some).as_deref(), Some("05:30"));
+        let absolute = dir.join("posix/Asia/Kolkata");
+        assert_eq!(
+            at(absolute.to_str().unwrap(), None).as_deref(),
+            Some("05:30")
+        );
+        // UTC for what is there but no regular file
+        assert_eq!(at("posix", some).as_deref(), Some("00:00"));
+        assert_eq!(at("/dev/zero", some).as_deref(), Some("00:00"));
+        // left to jiff: no file, not a zone file, empty
+        assert_eq!(at("posix/Asia/Delhi", some), None);
+        assert_eq!(at("broken", some), None);
+        assert_eq!(at(":", some), None);
+        assert_eq!(at("", some), None);
+        assert!(zone_file(None, None).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

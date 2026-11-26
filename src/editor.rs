@@ -11,7 +11,9 @@
 //!   appears above the prompt (`prompt_toolkit`'s `patch_stdout`),
 //! * a password prompt shows a star for each character typed, and Ctrl-C
 //!   at any prompt ends only that prompt, as it does there,
-//! * a line pasted along with a command answers the command's prompt.
+//! * a line pasted along with a command answers the command's prompt,
+//! * Ctrl-Z, Ctrl-\, Ctrl-O and a single ESC act as there (see
+//!   [`bind_keys`] and [`config`]).
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -24,7 +26,9 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::{ColorMode, CompletionType, Config, Context, Editor, Helper, Prompt};
+use rustyline::{
+    Cmd, ColorMode, CompletionType, Config, Context, Editor, EventHandler, Helper, KeyEvent, Prompt,
+};
 
 use crate::history::FileHistory;
 use crate::output;
@@ -328,15 +332,38 @@ fn ask(
     result
 }
 
-/// The settings of all line editors.
+/// The settings of all line editors. An ESC with nothing after it for half
+/// a second is a key of its own, as with `prompt_toolkit`'s `ttimeoutlen`;
+/// rustyline waits for the next key otherwise, and until then holds back
+/// what other tasks print above the prompt.
 fn config() -> rustyline::Result<Config> {
     Ok(Config::builder()
+        .keyseq_timeout(Some(500))
         .completion_type(CompletionType::List)
         .auto_add_history(false)
         .history_ignore_dups(true)?
         .max_history_size(100_000)?
         .color_mode(ColorMode::Enabled)
         .build())
+}
+
+/// Keys that act as in `prompt_toolkit`, where rustyline does something
+/// else. Ctrl-Z inserts itself instead of suspending the program: with more
+/// than one thread rustyline sets the terminal back to raw mode before the
+/// program has stopped, so after `fg` the first line was typed in cooked
+/// mode, echoed twice and without line editing. Ctrl-\ does nothing instead
+/// of ending the prompt like Ctrl-C, and Ctrl-O runs the line
+/// (`operate-and-get-next`, here without fetching the next history line).
+fn bind_keys(editor: &mut Editor<CliHelper, DefaultHistory>) {
+    // a bound `SelfInsert` repeats the last insert, `Insert` keeps its text
+    let ctrl_z = Cmd::Insert(1, "\x1a".to_string());
+    for (key, cmd) in [
+        (KeyEvent::ctrl('Z'), ctrl_z),
+        (KeyEvent::ctrl('\\'), Cmd::Noop),
+        (KeyEvent::ctrl('O'), Cmd::AcceptLine),
+    ] {
+        editor.bind_sequence(key, EventHandler::Simple(cmd));
+    }
 }
 
 /// A line editor with `prompt_toolkit` compatible history.
@@ -372,6 +399,7 @@ impl LineEditor {
             return Ok(editor);
         }
         let mut editor: Editor<CliHelper, DefaultHistory> = Editor::with_config(config()?)?;
+        bind_keys(&mut editor);
         editor.set_helper(Some(CliHelper {
             completion: Completion::None,
             files: FilenameCompleter::new(),

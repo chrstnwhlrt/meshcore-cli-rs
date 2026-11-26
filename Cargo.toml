@@ -31,8 +31,9 @@ meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs", tag = "v0.10.19
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "io-util", "net"] }
 
 # Line editing, history and completion; buffer-redux keeps the lines after
-# the first of several pasted at once
-rustyline = { version = "19.0.0", default-features = false, features = ["with-dirs", "buffer-redux"] }
+# the first of several pasted at once, custom-bindings lets Ctrl-Z insert
+# itself as in prompt_toolkit
+rustyline = { version = "19.0.0", default-features = false, features = ["with-dirs", "buffer-redux", "custom-bindings"] }
 
 # Display width of a typed password for its masking stars (as rustyline
 # measures it)

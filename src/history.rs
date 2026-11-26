@@ -91,7 +91,7 @@ pub fn format_entry(entry: &str, timestamp: &str) -> String {
 /// The local time like Python's `str(datetime.datetime.now())`, which
 /// `prompt_toolkit` writes: microseconds unless there are none.
 fn now_text() -> String {
-    let now = jiff::ZonedDateTime::now().datetime();
+    let now = crate::util::time::local_zone().to_datetime(jiff::Timestamp::now());
     let text = now.strftime("%Y-%m-%d %H:%M:%S").to_string();
     match now.subsec_nanosecond() / 1000 {
         0 => text,
