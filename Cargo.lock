@@ -682,8 +682,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meshcore"
-version = "0.10.16"
-source = "git+https://github.com/chrstnwhlrt/meshcore-rs?tag=v0.10.16#f1ba59f51bcf5324e8ae28ea8c78704096546274"
+version = "0.10.17"
+source = "git+https://github.com/chrstnwhlrt/meshcore-rs?tag=v0.10.17#5c024cb1834638750942ec38ba2bc21d2948777d"
 dependencies = [
  "aes",
  "bluer",
